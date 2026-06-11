@@ -87,6 +87,18 @@ class OptimizationParams(ParamGroup):
         self.densify_until_iter = 15_000
         self.densify_grad_threshold = 0.0002
         self.random_background = True
+        # ---- View-dependent stylized SH (Evaluation 1) — ALL default OFF ----
+        # These live in OptimizationParams so they reach BOTH train_feature.py and
+        # train_artistic.py (each forwards `opt` into GaussianModel.training_setup_*)
+        # without touching those scripts, and they are persisted into cfg_args so
+        # render.py can auto-detect the mode. With --view_dependent OFF every path
+        # below is bypassed → training / checkpoints / inference are byte-identical
+        # to upstream, and old checkpoints still load unchanged.
+        self.view_dependent = False                 # master opt-in switch (default OFF)
+        self.view_dependent_mode = "residual"       # {residual (Variant A), decoder_sh (Variant B)}
+        self.residual_scale = 1.0                   # Variant A blend weight a (0 == flat)
+        self.sh_degree_style = 2                    # Variant B: decoder predicts 3*(deg+1)^2 SH coeffs
+        self.sh_consistency_weight = 1.0            # Variant B: L2 weight on higher-order SH coeffs
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

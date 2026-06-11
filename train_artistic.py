@@ -11,9 +11,11 @@
 
 import os
 import torch
+from PIL import ImageFile
+ImageFile.LOAD_TRUNCATED_IMAGES = True  # WikiArt has a few truncated JPEGs; tolerate (forked DataLoader workers inherit this) instead of crashing mid-train
 from random import randint
 from utils.loss_utils import l1_loss, ssim
-from gaussian_renderer import render
+from gaussian_renderer import render, stylized_view_dependent_color, sh_consistency_regularizer
 import sys
 from scene import Scene, GaussianModel
 from utils.general_utils import safe_state
@@ -65,8 +67,13 @@ class InfiniteSamplerWrapper(torch.utils.data.sampler.Sampler):
     def __len__(self):
         return 2 ** 31
 
-def training(dataset, opt, pipe, ckpt_path, decoder_path, style_weight, content_preserve):
-    opt.iterations = 100_000 if not decoder_path else 30_000
+def training(dataset, opt, pipe, ckpt_path, decoder_path, style_weight, content_preserve, K=8, art_iterations=0, content_cache=True):
+    # art_iterations>0 顯式覆寫迭代數（K x D' sweep 用固定 30k 做乾淨比較；
+    # 或極短 iters 做 smoke test）。否則沿用原本 heuristic（無 decoder_path=100k、有=30k）。
+    if art_iterations and art_iterations > 0:
+        opt.iterations = art_iterations
+    else:
+        opt.iterations = 100_000 if not decoder_path else 30_000
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree)
@@ -75,7 +82,21 @@ def training(dataset, opt, pipe, ckpt_path, decoder_path, style_weight, content_
     vgg_encoder = VGGEncoder().cuda()
 
     # compute the final vgg features for each point, and init pointnet decoder
-    gaussians.training_setup_style(opt, decoder_path)
+    gaussians.training_setup_style(opt, decoder_path, K=K)
+
+    # View-dependent stylized SH (Eval 1). All default OFF -> the flat (upstream)
+    # path runs unchanged. `gaussians.training_setup_style` may have disabled
+    # view_dependent if the feature ckpt carried no SH, so read it back from there.
+    view_dependent = bool(getattr(gaussians, "view_dependent", False))
+    vd_mode = getattr(opt, "view_dependent_mode", "residual")
+    residual_scale = float(getattr(opt, "residual_scale", 1.0))
+    sh_degree_style = int(getattr(opt, "sh_degree_style", 2))
+    sh_consistency_weight = float(getattr(opt, "sh_consistency_weight", 1.0))
+    if view_dependent and vd_mode not in ("residual", "decoder_sh"):
+        raise ValueError(f"--view_dependent_mode must be 'residual' or 'decoder_sh', got {vd_mode!r}")
+    if view_dependent:
+        print(f"[view_dependent] ON  mode={vd_mode}  residual_scale={residual_scale}  "
+              f"sh_degree_style={sh_degree_style}  sh_consistency_weight={sh_consistency_weight}")
 
     # init wikiart dataset
     style_loader = getDataLoader(args.wikiartdir, batch_size=1, sampler=InfiniteSamplerWrapper, 
@@ -87,6 +108,24 @@ def training(dataset, opt, pipe, ckpt_path, decoder_path, style_weight, content_
 
     iter_start = torch.cuda.Event(enable_timing = True)
     iter_end = torch.cuda.Event(enable_timing = True)
+
+    # Per-camera content-feature cache (ROCm artistic-training speedup; ZERO quality
+    # change). The content loss only consumes vgg(gt).relu4_1, which is FIXED per
+    # camera (original_image never mutates), yet the upstream loop recomputes a full
+    # native-resolution VGG forward for it every style iteration under no_grad.
+    # Precompute relu4_1 once per train camera here and read it in the loop -> removes
+    # one native-res VGG forward/iter. Verified bitwise-identical to the recompute
+    # (max|Δ|=0 over all cameras), so loss/quality are unchanged. Memory cost is one
+    # relu4_1 map per camera (truck: ~17 MB x 251 cams ~= 4.3 GB fp32 VRAM, fits the
+    # 32 GB APU alongside ~8 GB training). Use --no_content_cache to fall back to the
+    # original per-iter recompute (e.g. if VRAM is tight on a very large camera set).
+    gt_content_relu4_1 = None
+    if content_cache:
+        gt_content_relu4_1 = {}
+        with torch.no_grad():
+            for cam in scene.getTrainCameras():
+                gt_content_relu4_1[cam.uid] = vgg_encoder(
+                    normalize_vgg(cam.original_image.cuda().unsqueeze(0))).relu4_1
 
     viewpoint_stack = None
     ema_loss_for_log = 0.0
@@ -103,8 +142,14 @@ def training(dataset, opt, pipe, ckpt_path, decoder_path, style_weight, content_
 
         # content preserve training
         if content_preserve and iteration % 7 == 0:
-            decoded_rgb = gaussians.decoder(gaussians.final_vgg_features.detach()) # [N, 3]
-            render_pkg = render(viewpoint_cam, gaussians, pipe, background, override_color=decoded_rgb)
+            decoded_rgb = gaussians.decoder(gaussians.final_vgg_features.detach()) # [N, 3] (or [N, 3*(deg+1)^2] for decoder_sh)
+            if view_dependent:
+                override = stylized_view_dependent_color(
+                    gaussians, viewpoint_cam, decoded_rgb, mode=vd_mode,
+                    residual_scale=residual_scale, sh_degree_style=sh_degree_style)
+            else:
+                override = decoded_rgb
+            render_pkg = render(viewpoint_cam, gaussians, pipe, background, override_color=override)
             rendered_rgb = render_pkg["render"] # [3, H, W]
             gt_image = viewpoint_cam.original_image.cuda() # [3, H, W]
             loss = l1_loss(gt_image, rendered_rgb)
@@ -123,12 +168,18 @@ def training(dataset, opt, pipe, ckpt_path, decoder_path, style_weight, content_
 
         # get style_img, this style_img has NOT been normalized according to the pretrained VGGmodel
         style_img = next(style_iter)[0].cuda()
-        gt_image = viewpoint_cam.original_image.cuda() # [3, H, W]
 
         # Render
         with torch.no_grad():
             style_img_features = vgg_encoder(normalize_vgg(style_img)) # [1, C, H, W]
-            gt_image_features = vgg_encoder(normalize_vgg(gt_image.unsqueeze(0)))
+            # content loss only needs gt relu4_1, which is fixed per camera -> read
+            # the precomputed cache instead of a fresh native-res VGG forward. Falls
+            # back to the original recompute when --no_content_cache is set.
+            if gt_content_relu4_1 is not None:
+                gt_relu4_1 = gt_content_relu4_1[viewpoint_cam.uid]
+            else:
+                gt_image = viewpoint_cam.original_image.cuda() # [3, H, W]
+                gt_relu4_1 = vgg_encoder(normalize_vgg(gt_image.unsqueeze(0))).relu4_1
 
         # decoder the features of points to rgb
         tranfered_features = gaussians.style_transfer(
@@ -136,20 +187,34 @@ def training(dataset, opt, pipe, ckpt_path, decoder_path, style_weight, content_
             style_img_features.relu3_1,
         )
 
-        decoded_rgb = gaussians.decoder(tranfered_features) # [N, 3]
+        decoded_rgb = gaussians.decoder(tranfered_features) # [N, 3] (or [N, 3*(deg+1)^2] for decoder_sh)
 
-        render_pkg = render(viewpoint_cam, gaussians, pipe, background, override_color=decoded_rgb)
+        if view_dependent:
+            # Per-view color: Variant A adds the frozen reconstruction SH residual;
+            # Variant B evaluates the decoder's per-Gaussian SH coeffs for this view.
+            override = stylized_view_dependent_color(
+                gaussians, viewpoint_cam, decoded_rgb, mode=vd_mode,
+                residual_scale=residual_scale, sh_degree_style=sh_degree_style)
+        else:
+            override = decoded_rgb
+
+        render_pkg = render(viewpoint_cam, gaussians, pipe, background, override_color=override)
         rendered_rgb = render_pkg["render"] # [3, H, W]
         
         # style loss and content loss
         rendered_rgb_features = vgg_encoder(normalize_vgg(rendered_rgb.unsqueeze(0))) 
 
-        content_loss = cal_mse_content_loss(gt_image_features.relu4_1, rendered_rgb_features.relu4_1)
+        content_loss = cal_mse_content_loss(gt_relu4_1, rendered_rgb_features.relu4_1)
         style_loss = 0.
         for style_feature, image_feature in zip(style_img_features, rendered_rgb_features):
             style_loss += cal_adain_style_loss(style_feature, image_feature)
 
         loss = content_loss + style_loss * style_weight
+        # Variant B: penalize higher-order SH coeffs to keep multi-view consistency.
+        if view_dependent and vd_mode == "decoder_sh" and sh_consistency_weight > 0:
+            sh_reg = sh_consistency_regularizer(decoded_rgb, sh_degree_style)
+            loss = loss + sh_consistency_weight * sh_reg
+            tb_writer.add_scalar('train_loss/sh_consistency', sh_reg.item(), iteration)
         loss.backward()
 
         iter_end.record()
@@ -176,6 +241,15 @@ def training(dataset, opt, pipe, ckpt_path, decoder_path, style_weight, content_
             if iteration < opt.iterations:
                 gaussians.optimizer.step()
                 gaussians.optimizer.zero_grad(set_to_none = True)
+
+            # ROCm long-run insurance: a native-resolution 30k artistic run is
+            # ~hours on a single APU, yet the upstream loop only saves at the
+            # very end. Periodically dump the style model so an interrupted run
+            # can warm-resume from the latest decoder via --decoder_path instead
+            # of restarting from scratch. Purely additive; training is unchanged.
+            if iteration % 5000 == 0 and iteration != opt.iterations:
+                os.makedirs(args.model_path + "/chkpnt", exist_ok=True)
+                torch.save(gaussians.capture(is_style_model=True), args.model_path + "/chkpnt/gaussians_" + str(iteration) + ".pth")
     # Save model
     os.makedirs(args.model_path + "/chkpnt", exist_ok = True)
     torch.save(gaussians.capture(is_style_model=True), args.model_path + "/chkpnt" + "/gaussians.pth")
@@ -218,6 +292,14 @@ if __name__ == "__main__":
     parser.add_argument("--exp_name", type=str, default='default')
     parser.add_argument("--style_weight", type=float, default=10.)
     parser.add_argument("--content_preserve", action='store_true', default=False)
+    parser.add_argument("--no_content_cache", action='store_true', default=False,
+                        help="關閉 per-camera gt VGG relu4_1 快取（預設開）。快取省去每個 style "
+                             "iter 一次原生解析 VGG forward、品質不變；關閉則退回原本每 iter 重算"
+                             "（VRAM 吃緊的超大相機集才需要）。")
+    parser.add_argument("--K", type=int, default=8,
+                        help="paper 的 KNN 鄰居數（GaussianConv decoder，預設 8；photorealistic 強制 1）")
+    parser.add_argument("--art_iterations", type=int, default=0,
+                        help=">0 則覆寫 artistic 迭代數（K x D' sweep 固定 30k / smoke 極短 iters）")
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
 
@@ -232,7 +314,7 @@ if __name__ == "__main__":
 
     # configure and run training
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.ckpt_path, args.decoder_path, args.style_weight, args.content_preserve)
+    training(lp.extract(args), op.extract(args), pp.extract(args), args.ckpt_path, args.decoder_path, args.style_weight, args.content_preserve, K=args.K, art_iterations=args.art_iterations, content_cache=not args.no_content_cache)
 
     # All done
     print("\nArtistic training complete.")

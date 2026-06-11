@@ -28,7 +28,10 @@ try:
 except ImportError:
     TENSORBOARD_FOUND = False
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
+def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from,
+             max_point_num=400_000, decouple_prune=True,
+             postreset_prune_cooldown=0, postreset_freeze_cooldown=0,
+             overcap_prune_size_only=False, overcap_prune_every=1):
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree)
@@ -102,7 +105,20 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                    gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold)
+                    # Track-C decouple-prune safety guards: pause densify activity
+                    # for a cooldown window after each opacity_reset so freshly
+                    # dimmed gaussians can recover before pruning/cloning resumes.
+                    since_reset = iteration % opt.opacity_reset_interval
+                    past_first_reset = iteration >= opt.opacity_reset_interval
+                    in_freeze = (postreset_freeze_cooldown > 0 and past_first_reset
+                                 and 0 < since_reset <= postreset_freeze_cooldown)
+                    skip_prune = (postreset_prune_cooldown > 0 and past_first_reset
+                                  and 0 < since_reset <= postreset_prune_cooldown)
+                    if not in_freeze:
+                        gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold,
+                                                    max_point_num=max_point_num, decouple_prune=decouple_prune,
+                                                    skip_prune=skip_prune, overcap_prune_size_only=overcap_prune_size_only,
+                                                    overcap_prune_every=overcap_prune_every)
                 
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
@@ -189,6 +205,21 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
     parser.add_argument("--exp_name", type=str, default='default')
+    # Growth cap for densification.  Default 4e5 leaves headroom above truck's
+    # natural ~337k so the cap rarely binds; when it does, the prune stays live
+    # (see GaussianModel.densify_and_prune).  --legacy_cap_freeze restores the
+    # old behaviour where exceeding the cap froze clone/split AND the prune.
+    parser.add_argument("--max_point_num", type=int, default=400_000)
+    parser.add_argument("--legacy_cap_freeze", action="store_true", default=False)
+    # Track-C decouple-prune safety guards (default off = plain decouple).
+    parser.add_argument("--postreset_prune_cooldown", type=int, default=0,
+                        help="skip the prune for N iters after each opacity_reset")
+    parser.add_argument("--postreset_freeze_cooldown", type=int, default=0,
+                        help="skip ALL densify+prune for N iters after each opacity_reset")
+    parser.add_argument("--overcap_prune_size_only", action="store_true", default=False,
+                        help="over the cap, prune only oversized/large-screen splats (skip opacity prune)")
+    parser.add_argument("--overcap_prune_every", type=int, default=1,
+                        help="over the cap, run the prune only every Kth densify step")
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     
@@ -203,7 +234,10 @@ if __name__ == "__main__":
 
     # Start GUI server, configure and run training
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from)
+    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from,
+             max_point_num=args.max_point_num, decouple_prune=not args.legacy_cap_freeze,
+             postreset_prune_cooldown=args.postreset_prune_cooldown, postreset_freeze_cooldown=args.postreset_freeze_cooldown,
+             overcap_prune_size_only=args.overcap_prune_size_only, overcap_prune_every=args.overcap_prune_every)
 
     # All done
     print("\nReconstruction complete.")

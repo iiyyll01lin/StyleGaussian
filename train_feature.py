@@ -26,14 +26,14 @@ from torch.utils.tensorboard import SummaryWriter
 from scene.VGG import VGGEncoder
 
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, ply_path, debug_from):
+def training(dataset, opt, pipe, testing_iterations, saving_iterations, ply_path, debug_from, low_dim=32):
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree)
     vgg_encoder = VGGEncoder().cuda()
     # load the rgb reconstructed gaussians ply file
     scene = Scene(dataset, gaussians, load_path=ply_path, vgg_encoder=vgg_encoder)
-    gaussians.training_setup_feature(opt)
+    gaussians.training_setup_feature(opt, low_dim=low_dim)
 
     bg_color = [1]*32 if dataset.white_background else [0]*32
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -120,6 +120,8 @@ if __name__ == "__main__":
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--ply_path", type=str, required=True)
     parser.add_argument("--exp_name", type=str, default='default')
+    parser.add_argument("--low_dim", type=int, default=32,
+                        help="paper 的 D'：每個 Gaussian 學的低維特徵維度 (預設 32)")
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
 
@@ -134,7 +136,7 @@ if __name__ == "__main__":
 
     # configure and run training
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.ply_path, args.debug_from)
+    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.ply_path, args.debug_from, low_dim=args.low_dim)
 
     # All done
     print("\nFeature training complete.")

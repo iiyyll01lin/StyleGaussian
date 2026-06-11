@@ -65,6 +65,16 @@ class Camera(nn.Module):
         self.feature_width = self.vgg_features.shape[2]
         self.feature_height = self.vgg_features.shape[1]
 
+    def extract_clip_features(self, clip_encoder):
+        # Lite LangSplat language field GT: a dense grid of CLIP embeddings,
+        # mirroring extract_vgg_features above. clip_encoder handles CLIP
+        # normalization / windowing internally and returns [D, H', W'] where
+        # D == clip_encoder.embed_dim (512 for ViT-B/16). Phase-2 distills a
+        # low-dim per-Gaussian field + linear decode to D, supervised by this.
+        self.clip_features = clip_encoder(self.original_image) # [D, H', W']
+        self.clip_feature_height = self.clip_features.shape[1]
+        self.clip_feature_width = self.clip_features.shape[2]
+
 class MiniCam:
     def __init__(self, width, height, fovy, fovx, znear, zfar, world_view_transform, full_proj_transform):
         self.image_width = width

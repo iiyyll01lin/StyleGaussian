@@ -24,7 +24,8 @@ class Scene:
     gaussians : GaussianModel
 
     def __init__(self, args : ModelParams, gaussians : GaussianModel, load_iteration=None,  
-                 load_path=None, style_model=False, shuffle=True, resolution_scales=[1.0], vgg_encoder=None):
+                 load_path=None, style_model=False, shuffle=True, resolution_scales=[1.0], vgg_encoder=None,
+                 clip_encoder=None):
         """
         :param path: Path to colmap scene main folder.
         """
@@ -80,6 +81,13 @@ class Scene:
                 print("Extracting VGG features...")
                 for cam in tqdm(self.train_cameras[resolution_scale]):
                     cam.extract_vgg_features(vgg_encoder)
+
+            # extract CLIP language features for each camera (LangSplat Lite).
+            # Mirrors the VGG precompute above; sets cam.clip_features [D,H',W'].
+            if clip_encoder:
+                print("Extracting CLIP features...")
+                for cam in tqdm(self.train_cameras[resolution_scale]):
+                    cam.extract_clip_features(clip_encoder)
 
         if load_path:
             extension = os.path.splitext(load_path)[1]

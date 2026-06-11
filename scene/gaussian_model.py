@@ -61,10 +61,10 @@ class GaussianModel:
         self.spatial_lr_scale = 0
         self.setup_functions()
 
-    def capture(self, is_feature_model=False, is_style_model=False):
+    def capture(self, is_feature_model=False, is_style_model=False, is_language_model=False):
         
         if is_feature_model:
-            return (
+            data = (
                 self._xyz,
                 self._scaling,
                 self._rotation,
@@ -72,9 +72,33 @@ class GaussianModel:
                 self._vgg_features,
                 self.feature_linear.state_dict(),
             )
-        
+            # View-dependent (Eval 1, Variant A): append the frozen reconstruction
+            # SH residual so it survives feature -> artistic. Only when opted-in;
+            # otherwise the tuple stays length-6 and old loaders are unaffected.
+            if getattr(self, "_carry_sh", False):
+                data = data + (self._features_dc, self._features_rest)
+            return data
+
+        if is_language_model:
+            # LangSplat-Lite CLIP language field (Eval 2). Same 6-entry shape as
+            # the feature model (xyz/scaling/rotation/opacity + the learned field
+            # + its linear decoder), so restore() can recover low_dim/CLIP dim from
+            # the saved weight. The optional carried SH follows Worker A's additive,
+            # length-tolerant pattern (default OFF -> a clean length-6 tuple).
+            data = (
+                self._xyz,
+                self._scaling,
+                self._rotation,
+                self._opacity,
+                self._clip_features,
+                self.clip_linear.state_dict(),
+            )
+            if getattr(self, "_carry_sh", False):
+                data = data + (self._features_dc, self._features_rest)
+            return data
+
         if is_style_model:
-            return (
+            data = (
                 self._xyz,
                 self._scaling,
                 self._rotation,
@@ -82,6 +106,9 @@ class GaussianModel:
                 self.final_vgg_features,
                 self.decoder.state_dict(),
             )
+            if getattr(self, "_carry_sh", False):
+                data = data + (self._features_dc, self._features_rest)
+            return data
 
         return (
             self.active_sh_degree,
@@ -98,7 +125,26 @@ class GaussianModel:
             self.spatial_lr_scale,
         )
     
-    def restore(self, model_args, training_args=None, from_feature_model=False, from_style_model=False):
+    def restore(self, model_args, training_args=None, from_feature_model=False, from_style_model=False, from_language_model=False):
+
+        if from_language_model:
+            (self._xyz,
+            self._scaling,
+            self._rotation,
+            self._opacity,
+            self._clip_features,
+            self.clip_linear_state_dict) = model_args[:6]
+            # Recover low_dim (inChanel) and CLIP dim (out_dim) straight off the
+            # decoder weight [out_dim, inChanel], so any low_dim / CLIP model loads
+            # (mirrors the feature model's self-describing restore).
+            self.low_dim_clip = self.clip_linear_state_dict['layer.weight'].shape[1]
+            self.clip_dim = self.clip_linear_state_dict['layer.weight'].shape[0]
+            self.clip_linear = LinearLayer(inChanel=self.low_dim_clip, out_dim=self.clip_dim).cuda()
+            self.clip_linear.load_state_dict(self.clip_linear_state_dict)
+            # Length-tolerant: reattach the optional carried SH (len>6) exactly like
+            # the feature/style restore; a clean length-6 language ckpt is flat.
+            self._restore_carried_sh(model_args)
+            return
 
         if from_feature_model:
             (self._xyz,
@@ -106,9 +152,17 @@ class GaussianModel:
             self._rotation,
             self._opacity,
             self._vgg_features,
-            self.feature_linear_state_dict) = model_args
-            self.feature_linear = LinearLayer(inChanel=32, out_dim=256).cuda()
+            self.feature_linear_state_dict) = model_args[:6]
+            # 從 state_dict 推回 D'(low-dim)：LinearLayer.layer.weight 形狀
+            # [out_dim=256, inChanel]（feape=0），inChanel 即訓練時用的 low_dim。
+            # 這樣不論 checkpoint 用 16/32/... 都能正確還原（向後相容舊的 32）。
+            self.low_dim = self.feature_linear_state_dict['layer.weight'].shape[1]
+            self.feature_linear = LinearLayer(inChanel=self.low_dim, out_dim=256).cuda()
             self.feature_linear.load_state_dict(self.feature_linear_state_dict)
+            # View-dependent (Variant A): a checkpoint trained with --view_dependent
+            # carries the frozen reconstruction SH after the 6 base entries. Old
+            # length-6 checkpoints take the else-branch and behave exactly as before.
+            self._restore_carried_sh(model_args)
             return
         
         if from_style_model:
@@ -117,10 +171,33 @@ class GaussianModel:
             self._rotation,
             self._opacity,
             self.final_vgg_features,
-            self.decoder_state_dict) = model_args
-            self.decoder = GaussianConv(self.get_xyz.detach()).cuda()
-            self.decoder.load_state_dict(self.decoder_state_dict)
+            self.decoder_state_dict) = model_args[:6]
+            # 從 decoder state_dict 推回 K 與每層寬度：kernels.0 形狀 [256, K*256]
+            # → K = shape[1] // 256；每層 out width = kernels.i 的 shape[0]。直接從
+            # 權重推回 layers_channel 同時支援舊的 RGB head (out=3) 與 Variant B 的
+            # SH head (out=3*(deg+1)^2)，且舊 checkpoint 還原成 [256,128,64,32,3]。
+            input_channel = 256
+            sd = self.decoder_state_dict
+            kernel_keys = sorted([k for k in sd if k.startswith("kernels.")],
+                                 key=lambda x: int(x.split(".")[1]))
+            layers_channel = [sd[k].shape[0] for k in kernel_keys]
+            K = sd['kernels.0'].shape[1] // input_channel
+            self.decoder = GaussianConv(
+                self.get_xyz.detach(), input_channel=input_channel,
+                layers_channel=layers_channel, K=K
+            ).cuda()
+            self.decoder.load_state_dict(sd)
             self.style_transfer = MulLayer().cuda()
+            self._restore_carried_sh(model_args)
+            # Variant B (decoder_sh): a non-RGB decoder head (out != 3) means the
+            # decoder predicts per-Gaussian SH coeffs. Detect it from the head width
+            # so the checkpoint is self-describing for render() — cfg_args only
+            # persists ModelParams, so render cannot read the optimisation flags.
+            out_width = layers_channel[-1]
+            if out_width != 3 and not self._carry_sh:
+                self.view_dependent = True
+                self.view_dependent_mode = "decoder_sh"
+                self.sh_degree_style = int(round((out_width / 3.0) ** 0.5)) - 1
             return
 
         (self.active_sh_degree, 
@@ -140,6 +217,28 @@ class GaussianModel:
         self.denom = denom
         self.optimizer.load_state_dict(opt_dict)
 
+    def _restore_carried_sh(self, model_args):
+        """Restore the optional view-dependent SH residual appended to a feature /
+        style checkpoint (Eval 1, Variant A). Length-6 (legacy) checkpoints carry no
+        SH → behaviour is unchanged. When present, the frozen reconstruction SH is
+        reattached and the view-dependent flags are set so render() can synthesize
+        per-view color."""
+        if len(model_args) > 6:
+            self._features_dc = model_args[6]
+            self._features_rest = model_args[7]
+            self._carry_sh = True
+            self.view_dependent = True
+            self.view_dependent_mode = "residual"
+            # The carried SH is full-degree (from a finished reconstruction), so make
+            # the active degree match for any code that reads active_sh_degree.
+            self.active_sh_degree = self.max_sh_degree
+        else:
+            # Flat baseline; the from_style_model caller may still detect a Variant B
+            # decoder_sh head from the decoder geometry and flip this back on.
+            self._carry_sh = False
+            self.view_dependent = False
+            self.view_dependent_mode = "residual"
+
     @property
     def get_scaling(self):
         return self.scaling_activation(self._scaling)
@@ -157,6 +256,14 @@ class GaussianModel:
         features_dc = self._features_dc
         features_rest = self._features_rest
         return torch.cat((features_dc, features_rest), dim=1)
+
+    @property
+    def final_clip_features(self):
+        # Per-Gaussian decoded CLIP features [N, clip_dim] for language relevancy
+        # (Eval 2). Decodes the learned low-dim field through clip_linear, the same
+        # forward_directly_on_point used to bake final_vgg_features. Only valid
+        # after training_setup_language / restore(from_language_model=True).
+        return self.clip_linear.forward_directly_on_point(self._clip_features)
     
     @property
     def get_opacity(self):
@@ -214,18 +321,77 @@ class GaussianModel:
                                                     lr_delay_mult=training_args.position_lr_delay_mult,
                                                     max_steps=training_args.position_lr_max_steps)
         
-    def training_setup_feature(self, training_args):
-        # delete spherical harmonics because we don't need them for feature reconstruction
-        del self._features_rest
-        del self._features_dc
+    def training_setup_feature(self, training_args, low_dim=32):
+        # View-dependent (Eval 1, Variant A): keep the reconstruction's SH residual
+        # alive so it can survive into the style checkpoint. It is frozen (detached,
+        # not an nn.Parameter), never added to the optimizer, and the feature render
+        # path splats `_vgg_features` (never `get_features`) — so feature training
+        # stays bit-identical; only the saved feature.pth carries the extra SH.
+        # `training_args` is the optimization param group (train_feature.py forwards
+        # it here), which carries the --view_dependent flags. Default OFF -> the SH
+        # is deleted exactly as upstream.
+        self.view_dependent = bool(getattr(training_args, "view_dependent", False))
+        self.view_dependent_mode = getattr(training_args, "view_dependent_mode", "residual")
+        self._carry_sh = self.view_dependent and self.view_dependent_mode == "residual"
+        if self._carry_sh:
+            self._features_dc = self._features_dc.detach()
+            self._features_rest = self._features_rest.detach()
+        else:
+            # delete spherical harmonics because we don't need them for feature reconstruction
+            del self._features_rest
+            del self._features_dc
 
-        _vgg_features = torch.randn((self.get_xyz.shape[0], 32), device="cuda").requires_grad_(True)
+        # low_dim = paper 的 D'（每個 Gaussian 學的低維特徵維度，預設 32）。可配置。
+        self.low_dim = low_dim
+        _vgg_features = torch.randn((self.get_xyz.shape[0], low_dim), device="cuda").requires_grad_(True)
         self._vgg_features = nn.Parameter(_vgg_features)
-        self.feature_linear = LinearLayer(inChanel=32, out_dim=256).cuda()
+        self.feature_linear = LinearLayer(inChanel=low_dim, out_dim=256).cuda()
 
         l = [
             {'params': [self._vgg_features], 'lr': 0.01, "name": "vgg_features"},
             {'params': self.feature_linear.parameters(), 'lr': 1e-3, "name": "feature_linear"}
+        ]
+
+        self.optimizer = torch.optim.Adam(l, eps=1e-15)
+
+    def training_setup_language(self, training_args, low_dim=32, clip_dim=512):
+        # LangSplat-Lite CLIP language field (Eval 2), mirroring
+        # training_setup_feature but with a SEPARATE per-Gaussian field
+        # `_clip_features [N, low_dim]` and a `clip_linear` LinearLayer decoding it
+        # back to CLIP space (out_dim == clip_encoder.embed_dim, 512 for ViT-B/16).
+        # The render feature path splats `_clip_features` via render(..., 
+        # feature_override=...) and the L1 loss matches the splatted+decoded map
+        # against Camera.clip_features. This is a brand-new, additive setup entry:
+        # the existing feature/artistic/recon setups are untouched.
+        #
+        # device-following (self.get_xyz.device) so the shape/decoder logic is
+        # unit-testable on CPU; on the GPU box xyz is cuda so behaviour is
+        # identical to the feature stage's hard-coded .cuda().
+        device = self.get_xyz.device
+
+        # The localized blend reads the photoreal original color off the ARTISTIC
+        # model, so the language field itself needs no SH. Still, follow Worker A's
+        # default-OFF `_carry_sh` pattern for a self-describing checkpoint; with it
+        # OFF (the LITE default) the SH is dropped exactly like the feature stage.
+        self.view_dependent = bool(getattr(training_args, "view_dependent", False))
+        self.view_dependent_mode = getattr(training_args, "view_dependent_mode", "residual")
+        self._carry_sh = self.view_dependent and self.view_dependent_mode == "residual"
+        if self._carry_sh:
+            self._features_dc = self._features_dc.detach()
+            self._features_rest = self._features_rest.detach()
+        else:
+            del self._features_rest
+            del self._features_dc
+
+        self.low_dim_clip = low_dim
+        self.clip_dim = clip_dim
+        _clip_features = torch.randn((self.get_xyz.shape[0], low_dim), device=device).requires_grad_(True)
+        self._clip_features = nn.Parameter(_clip_features)
+        self.clip_linear = LinearLayer(inChanel=low_dim, out_dim=clip_dim).to(device)
+
+        l = [
+            {'params': [self._clip_features], 'lr': 0.01, "name": "clip_features"},
+            {'params': self.clip_linear.parameters(), 'lr': 1e-3, "name": "clip_linear"}
         ]
 
         self.optimizer = torch.optim.Adam(l, eps=1e-15)
@@ -247,7 +413,13 @@ class GaussianModel:
 
         self.optimizer = torch.optim.Adam(l, eps=1e-15)
 
-    def training_setup_style(self, training_args, decoder_path, photorealistic=False):
+    def training_setup_style(self, training_args, decoder_path, photorealistic=False, K=8):
+        # View-dependent flags (Eval 1). `training_args` is the optimization param
+        # group forwarded by train_artistic.py. All default OFF -> upstream behaviour.
+        self.view_dependent = bool(getattr(training_args, "view_dependent", False))
+        self.view_dependent_mode = getattr(training_args, "view_dependent_mode", "residual")
+        sh_degree_style = int(getattr(training_args, "sh_degree_style", 2))
+
         # compute the final vgg features for each point
         self.final_vgg_features = self.feature_linear.forward_directly_on_point(self._vgg_features)
         self.final_vgg_features += torch.randn_like(self.final_vgg_features) # Hack: randomness improves stylization quality
@@ -256,8 +428,24 @@ class GaussianModel:
         del self._vgg_features
         del self.feature_linear
 
-        # init gaussian conv
-        self.decoder = GaussianConv(self.get_xyz.detach(), K=(1 if photorealistic else 8)).cuda()
+        # Variant A: keep the (already-restored, frozen) reconstruction SH residual so
+        # it survives into the style checkpoint. Do NOT delete it here. If residual
+        # mode was requested but the feature ckpt carried no SH, fall back to flat.
+        self._carry_sh = (self.view_dependent and self.view_dependent_mode == "residual"
+                          and hasattr(self, "_features_dc"))
+        if self.view_dependent and self.view_dependent_mode == "residual" and not hasattr(self, "_features_dc"):
+            print("[view_dependent] residual mode requested but the feature checkpoint carried no "
+                  "SH residual — re-run feature training with --view_dependent. Falling back to flat.")
+            self.view_dependent = False
+
+        # Variant B: decoder head emits per-Gaussian SH coeffs (3*(deg+1)^2) not RGB.
+        out_channel = None
+        if self.view_dependent and self.view_dependent_mode == "decoder_sh":
+            out_channel = 3 * (sh_degree_style + 1) ** 2
+
+        # init gaussian conv（K = paper 的 KNN 鄰居數，可配置；photorealistic 仍強制 K=1）
+        self.decoder = GaussianConv(self.get_xyz.detach(), K=(1 if photorealistic else K),
+                                    out_channel=out_channel).cuda()
         if decoder_path:
             print('Init decoder from {}'.format(decoder_path))
             (_xyz,
@@ -265,7 +453,7 @@ class GaussianModel:
             _rotation,
             _opacity,
             final_vgg_features,
-            decoder_state_dict) = torch.load(decoder_path)
+            decoder_state_dict) = torch.load(decoder_path)[:6]
             self.decoder.load_state_dict(decoder_state_dict)
 
         # init style transfer module
@@ -499,24 +687,81 @@ class GaussianModel:
 
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation)
 
-    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, max_point_num=3e5):
-        if self.get_xyz.shape[0] > max_point_num: return
+    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, max_point_num=3e5, decouple_prune=True,
+                          skip_prune=False, overcap_prune_size_only=False, overcap_prune_every=1):
+        # The growth cap (max_point_num) must gate ONLY clone/split, never the
+        # opacity/size prune.  The legacy code early-returned the whole method
+        # once the count exceeded the cap, which also froze the
+        # opacity(<min_opacity)/size prune for the rest of densification, so
+        # faded + oversized gaussians (floaters) accumulated and were never
+        # culled.  Decoupling keeps the prune running at the cap: the count
+        # oscillates just below it while floaters are continuously removed and
+        # clone/split refills the freed budget with well-placed gaussians.
+        # decouple_prune=False restores the legacy freeze-everything behaviour.
+        #
+        # Plain decoupling, however, collapses the reconstruction on gfx1151:
+        # pruning/cloning keeps churning right after each opacity_reset and the
+        # freshly-dimmed gaussians never recover (held-out PSNR 22->9->6).  These
+        # opt-in guards make the decoupled prune safe (all default to the plain
+        # decouple behaviour so the legacy/baseline paths are untouched):
+        #   skip_prune               - caller signals a post-reset cooldown; skip
+        #                              the prune this call so opacities recover.
+        #   overcap_prune_size_only  - over the cap, drop only oversized / large-
+        #                              screen splats, never the opacity(<min) set.
+        #   overcap_prune_every      - over the cap, run the prune only every Kth
+        #                              densify call (gentler cadence).
+        over_cap = self.get_xyz.shape[0] > max_point_num
+        if over_cap and not decouple_prune:
+            return
 
-        grads = self.xyz_gradient_accum / self.denom
-        grads[grads.isnan()] = 0.0
+        if not over_cap:
+            grads = self.xyz_gradient_accum / self.denom
+            grads[grads.isnan()] = 0.0
 
-        self.densify_and_clone(grads, max_grad, extent)
-        self.densify_and_split(grads, max_grad, extent)
+            self.densify_and_clone(grads, max_grad, extent)
+            self.densify_and_split(grads, max_grad, extent)
 
-        prune_mask = (self.get_opacity < min_opacity).squeeze()
-        if max_screen_size:
-            big_points_vs = self.max_radii2D > max_screen_size
-            big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
-            prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
-        self.prune_points(prune_mask)
+        run_prune = not skip_prune
+        prune_opacity = True
+        if over_cap:
+            self._overcap_densify_calls = getattr(self, "_overcap_densify_calls", 0) + 1
+            if overcap_prune_every > 1 and (self._overcap_densify_calls % overcap_prune_every) != 0:
+                run_prune = False
+            if overcap_prune_size_only:
+                prune_opacity = False
+
+        if run_prune:
+            if prune_opacity:
+                prune_mask = (self.get_opacity < min_opacity).squeeze()
+            else:
+                prune_mask = torch.zeros(self.get_xyz.shape[0], dtype=torch.bool, device="cuda")
+            if max_screen_size:
+                big_points_vs = self.max_radii2D > max_screen_size
+                big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
+                prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
+            self.prune_points(prune_mask)
 
         torch.cuda.empty_cache()
 
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
-        self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
+        # Read the screen-space gradient that drives clone/split.  Prefer
+        # gsplat's absolute pixel-space gradient (info["means2d"].absgrad, the
+        # AbsGS criterion, set during gsplat's rasterize backward); fall back
+        # to .grad (the INRIA `original` backend writes the NDC screen-space
+        # gradient there directly).  See gsplat_backend.py section 3.
+        grad = getattr(viewspace_point_tensor, "absgrad", None)
+        if grad is None:
+            grad = viewspace_point_tensor.grad
+        if grad is None:
+            return
+        if grad.dim() == 3:
+            # gsplat means2d is [C, N, 2]; StyleGaussian renders one camera at
+            # a time, so collapse the (size-1) camera dim to [N, 2].
+            grad = grad[0]
+        ndc_scale = getattr(viewspace_point_tensor, "sg_ndc_scale", None)
+        if ndc_scale is not None:
+            # Convert gsplat pixel-space grads to INRIA's NDC convention
+            # (x*=0.5*W, y*=0.5*H) so densify_grad_threshold=0.0002 still applies.
+            grad = grad * ndc_scale
+        self.xyz_gradient_accum[update_filter] += torch.norm(grad[update_filter, :2], dim=-1, keepdim=True)
         self.denom[update_filter] += 1
