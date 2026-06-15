@@ -275,6 +275,47 @@ class CLIPEncoder(nn.Module):
         return F.normalize(emb.float(), dim=-1)
 
     # ------------------------------------------------------- MaskCLIP dense path
+    @staticmethod
+    def _embeds_dense(visual, images: Tensor) -> Tensor:
+        """``visual._embeds`` but with bicubic-resampled positional embeddings.
+
+        open_clip's ``VisionTransformer._embeds`` adds a *fixed-size* positional
+        embedding (1 CLS + ``grid0**2`` patches, trained at the native resolution,
+        e.g. 14×14 for ViT-B/16 @ 224), so feeding a larger ``input_resolution``
+        raises a token-count mismatch. For dense MaskCLIP GT at a higher grid we
+        bicubically resample the patch positional embeddings to the new grid (the
+        standard ViT / DeiT / MaskCLIP recipe). At the native resolution the
+        resample is an identity, so the 224 path stays byte-for-byte unchanged.
+        """
+        x = visual.conv1(images)  # [B, width, gh, gw]
+        gh, gw = int(x.shape[-2]), int(x.shape[-1])
+        width = x.shape[1]
+        x = x.reshape(x.shape[0], width, gh * gw).permute(0, 2, 1)  # [B, gh*gw, width]
+
+        cls = visual.class_embedding.to(x.dtype).reshape(1, 1, -1).expand(x.shape[0], -1, -1)
+        x = torch.cat([cls, x], dim=1)  # [B, 1+gh*gw, width]
+
+        pe = visual.positional_embedding.to(x.dtype)  # [1+grid0**2, width]
+        n_patch = gh * gw
+        if pe.shape[0] != n_patch + 1:
+            cls_pe, patch_pe = pe[:1], pe[1:]  # [1, width], [grid0**2, width]
+            s0 = int(round(patch_pe.shape[0] ** 0.5))
+            if s0 * s0 != patch_pe.shape[0]:
+                raise RuntimeError(
+                    f"無法把 {patch_pe.shape[0]} 個位置編碼還原成方形 grid 以重採樣。"
+                )
+            patch_pe = patch_pe.reshape(1, s0, s0, width).permute(0, 3, 1, 2)  # [1,width,s0,s0]
+            patch_pe = F.interpolate(
+                patch_pe, size=(gh, gw), mode="bicubic", align_corners=False, antialias=True,
+            )
+            patch_pe = patch_pe.permute(0, 2, 3, 1).reshape(n_patch, width)
+            pe = torch.cat([cls_pe, patch_pe], dim=0)
+        x = x + pe
+
+        x = visual.patch_dropout(x)
+        x = visual.ln_pre(x)
+        return x
+
     @torch.no_grad()
     def _dense_tokens(self, images: Tensor) -> Tuple[Tensor, int, int]:
         """MaskCLIP per-patch dense tokens from the frozen open_clip ViT.
@@ -307,7 +348,7 @@ class CLIPEncoder(nn.Module):
                 "此模型用 attn_pool，請改用支援的架構。"
             )
 
-        x = visual._embeds(images)  # [B, 1+N, width]; batch_first
+        x = self._embeds_dense(visual, images)  # [B, 1+N, width]; pos-embed resampled
         blocks = visual.transformer.resblocks
         for blk in blocks[:-1]:
             x = blk(x)

@@ -37,6 +37,7 @@ reconstruction / feature / artistic / render paths are untouched.
 
 import os
 import torch
+import torch.nn.functional as F
 from random import randint
 from utils.loss_utils import l1_loss
 from gaussian_renderer import render
@@ -52,18 +53,40 @@ from torch.utils.tensorboard import SummaryWriter
 
 
 def training(dataset, opt, pipe, ply_path, debug_from, low_dim=32,
-             clip_model="ViT-B-16", clip_pretrained="openai", clip_grid=8):
+             clip_model="ViT-B-16", clip_pretrained="openai", clip_grid=8,
+             distill_loss="l1", clip_input_res=224, gt_mode="maskclip",
+             sam_checkpoint=None, sam_model_type="vit_b", sam_grid=14,
+             sam_points_per_side=16, sam_cache_dir=None):
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree)
 
     # Frontend CLIP (Worker B's API). fp32 on gfx1151 (NEVER bf16). The Scene
     # precomputes cam.clip_features [D, H', W'] over the TRAIN cameras, mirroring
-    # the VGG precompute loop.
-    clip_encoder = CLIPEncoder(
-        model_name=clip_model, pretrained=clip_pretrained,
-        device="cuda", grid=(clip_grid, clip_grid), dtype=torch.float32,
-    )
+    # the VGG precompute loop. input_resolution drives the MaskCLIP patch grid
+    # (ViT-B/16: res/16 per side, so 224->14x14, 448->28x28 = denser GT).
+    #
+    # Two GT producers, SAME [D, gh, gw] contract downstream:
+    #   * gt_mode="maskclip" (default): MaskCLIP per-patch dense tokens (no SAM).
+    #   * gt_mode="sam_pooled" (roadmap A1 fallback): SAM regions -> per-region
+    #     CLIP -> painted into the grid, for cleaner object masks.
+    if gt_mode == "sam_pooled":
+        from scene.sam_pooled_encoder import SAMPooledEncoder
+        if not sam_checkpoint:
+            raise ValueError("gt_mode=sam_pooled 需要 --sam_checkpoint <path>.")
+        clip_encoder = SAMPooledEncoder(
+            sam_checkpoint=sam_checkpoint, sam_model_type=sam_model_type,
+            clip_model=clip_model, clip_pretrained=clip_pretrained,
+            device="cuda", grid=(sam_grid, sam_grid), dtype=torch.float32,
+            input_resolution=clip_input_res, points_per_side=sam_points_per_side,
+            cache_dir=sam_cache_dir,
+        )
+    else:
+        clip_encoder = CLIPEncoder(
+            model_name=clip_model, pretrained=clip_pretrained,
+            device="cuda", grid=(clip_grid, clip_grid), dtype=torch.float32,
+            input_resolution=clip_input_res,
+        )
 
     # Load the (shared, same-as-feature/artistic) reconstruction ply and bake the
     # CLIP grid GT into every train camera.
@@ -71,7 +94,8 @@ def training(dataset, opt, pipe, ply_path, debug_from, low_dim=32,
     gaussians.training_setup_language(opt, low_dim=low_dim, clip_dim=clip_encoder.embed_dim)
 
     # The feature rasterizer renders at cam.feature_height/width; point it at the
-    # CLIP grid dims so the rendered map lines up with the CLIP GT for the L1 loss.
+    # CLIP grid dims so the rendered map lines up with the CLIP GT (the distill
+    # loss is per-cell, so rendered H'xW' MUST equal the MaskCLIP gh x gw).
     for cam in scene.getTrainCameras():
         cam.feature_height = cam.clip_feature_height
         cam.feature_width = cam.clip_feature_width
@@ -106,9 +130,17 @@ def training(dataset, opt, pipe, ply_path, debug_from, low_dim=32,
                             feature_override=gaussians._clip_features)
         rendered_feature = render_pkg["render"]  # [D=clip_dim, H', W']
 
-        # Loss: L1 against the CLIP grid GT (L2-normalized per cell).
+        # Loss against the CLIP grid GT (each cell L2-normalized along D).
         gt_feature = viewpoint_cam.clip_features  # [D, H', W']
-        loss = l1_loss(rendered_feature, gt_feature)
+        if distill_loss == "cosine":
+            # CLIP features are directional; match the GT direction per cell
+            # (L2-normalize the decoded render along D, GT is already unit) so
+            # we distill semantic direction rather than L1 magnitude.
+            rendered_n = F.normalize(rendered_feature, dim=0)
+            cos = (rendered_n * gt_feature).sum(dim=0)  # [H', W'] per-cell cos
+            loss = (1.0 - cos).mean()
+        else:
+            loss = l1_loss(rendered_feature, gt_feature)
         loss.backward()
 
         iter_end.record()
@@ -121,7 +153,7 @@ def training(dataset, opt, pipe, ply_path, debug_from, low_dim=32,
             if iteration == opt.iterations:
                 progress_bar.close()
 
-            tb_writer.add_scalar('train_loss/l1_loss', loss.item(), iteration)
+            tb_writer.add_scalar(f'train_loss/{distill_loss}_loss', loss.item(), iteration)
 
             # Optimizer step
             if iteration < opt.iterations:
@@ -174,6 +206,27 @@ if __name__ == "__main__":
                         help="open_clip pretrained tag ('openai'); pass 'none' for random weights (offline smoke)")
     parser.add_argument("--clip_grid", type=int, default=8,
                         help="CLIP dense-grid GT resolution (rows==cols); raise (e.g. 16-32) for sharper masks")
+    parser.add_argument("--distill_loss", type=str, default="l1", choices=["l1", "cosine"],
+                        help="distillation loss vs the CLIP GT grid: 'l1' (default, back-compat) "
+                             "or 'cosine' (1 - per-cell cosine, preserves CLIP semantic direction)")
+    parser.add_argument("--clip_input_res", type=int, default=224,
+                        help="CLIP image-tower input resolution; drives the MaskCLIP patch grid "
+                             "(ViT-B/16: res/16 per side, so 224->14x14, 448->28x28 = denser GT)")
+    parser.add_argument("--gt_mode", type=str, default="maskclip",
+                        choices=["maskclip", "sam_pooled"],
+                        help="CLIP GT producer: 'maskclip' (per-patch dense tokens, default) or "
+                             "'sam_pooled' (SAM region-pooled CLIP, roadmap A1 fallback)")
+    parser.add_argument("--sam_checkpoint", type=str, default=None,
+                        help="SAM checkpoint path (required for --gt_mode sam_pooled)")
+    parser.add_argument("--sam_model_type", type=str, default="vit_b",
+                        choices=["vit_b", "vit_l", "vit_h"],
+                        help="SAM architecture matching --sam_checkpoint")
+    parser.add_argument("--sam_grid", type=int, default=14,
+                        help="SAM-pooled GT grid (rows==cols); 14 matches the MaskCLIP field")
+    parser.add_argument("--sam_points_per_side", type=int, default=16,
+                        help="SAM automatic-mask sampling density (fewer = larger, cleaner regions)")
+    parser.add_argument("--sam_cache_dir", type=str, default=None,
+                        help="dir to cache SAM-pooled [D,gh,gw] GT grids (skips SAM+CLIP on re-run)")
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
 
@@ -193,7 +246,11 @@ if __name__ == "__main__":
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
     training(lp.extract(args), op.extract(args), pp.extract(args), args.ply_path, args.debug_from,
              low_dim=args.low_dim, clip_model=args.clip_model,
-             clip_pretrained=clip_pretrained, clip_grid=args.clip_grid)
+             clip_pretrained=clip_pretrained, clip_grid=args.clip_grid,
+             distill_loss=args.distill_loss, clip_input_res=args.clip_input_res,
+             gt_mode=args.gt_mode, sam_checkpoint=args.sam_checkpoint,
+             sam_model_type=args.sam_model_type, sam_grid=args.sam_grid,
+             sam_points_per_side=args.sam_points_per_side, sam_cache_dir=args.sam_cache_dir)
 
     # All done
     print("\nLanguage training complete.")
