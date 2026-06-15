@@ -1,4 +1,4 @@
-"""CLIP encoder for the LangSplat-style language feature field (Lite, no SAM).
+"""CLIP encoder for the LangSplat-style language feature field (MaskCLIP dense GT).
 
 This mirrors the role of :mod:`scene.VGG` in the existing pipeline. Where
 ``VGGEncoder`` turns an image into a dense conv feature map (``relu3_1`` →
@@ -8,17 +8,31 @@ supervise a per-Gaussian CLIP **language** field in exactly the same way
 (distill a low-dim field + linear decode back to CLIP dim, see
 ``train_feature.py`` / ``GaussianModel.training_setup_feature``).
 
-Lite path (this file)
----------------------
-Each spatial cell of the output map is the CLIP embedding of one image window
-obtained by sliding-window / grid cropping (optionally overlapping). This needs
-nothing beyond a frozen CLIP image tower, so it is cheap and ROCm-safe (fp32 /
-fp16, **no bf16** per the gfx1151 notes). Boundaries are coarse but enough to
-drive a 3D, multi-view-consistent language mask.
+MaskCLIP dense path (:meth:`CLIPEncoder.forward`)
+-------------------------------------------------
+The original "Lite" path cropped each grid cell and ran **whole-window** CLIP on
+it; the resulting per-cell embeddings were the *image-level* CLIP vector of each
+window, which is **not** spatially discriminative (truck≈road, IoU≈chance — see
+the language localization report and docs/06). This version instead extracts
+**MaskCLIP-style per-patch dense tokens** (Zhou et al., *Extract Free Dense
+Labels from CLIP*, ECCV 2022) directly from the frozen open_clip ViT:
+
+* run the ViT through all but the **last** transformer block normally;
+* in the last block, **bypass the query·key attention pooling** and keep only the
+  value→out-projection of each patch token (drop the residual + MLP), so each
+  spatial token carries *its own* local semantics instead of the globally pooled
+  image vector;
+* apply the final ``ln_post`` + visual ``proj`` per token and reshape the patch
+  tokens to ``[D, gh, gw]`` (``14×14`` for ViT-B/16 @ 224, ``D=512``).
+
+The **output contract is unchanged** (still ``[D, gh, gw]``, each cell
+L2-normalized), so ``cameras.extract_clip_features`` / ``train_language.py`` /
+the field + ``clip_linear`` decoder / relevancy all stay byte-for-byte the same
+downstream. Needs nothing beyond the frozen CLIP image tower — no SAM, no new
+deps — and is ROCm-safe (fp32 / fp16, **no bf16** per the gfx1151 notes).
 
 The full LangSplat hierarchy (SAM 3-level masks + per-region CLIP + scene
-autoencoder) is intentionally **out of scope** here and documented as future
-work.
+autoencoder) remains **out of scope** here and documented as a future fallback.
 
 Import safety
 -------------
@@ -260,9 +274,81 @@ class CLIPEncoder(nn.Module):
         emb = self.model.encode_text(tokens)
         return F.normalize(emb.float(), dim=-1)
 
+    # ------------------------------------------------------- MaskCLIP dense path
+    @torch.no_grad()
+    def _dense_tokens(self, images: Tensor) -> Tuple[Tensor, int, int]:
+        """MaskCLIP per-patch dense tokens from the frozen open_clip ViT.
+
+        Runs the ViT through all but the last transformer block normally, then in
+        the last block **drops the query·key attention pooling** and keeps only
+        the value→out-projection of each patch token (plus the block's layer-scale
+        ``ls_1`` if any), discarding the residual + MLP. Applies the final
+        ``ln_post`` + visual ``proj`` per token. This is the standard MaskCLIP
+        reformulation that turns CLIP's globally-pooled tower into a dense,
+        spatially-localized feature extractor without any training.
+
+        Parameters
+        ----------
+        images : Tensor
+            ``[B, 3, R, R]`` already CLIP-normalized and on the model device/dtype
+            (``R == input_resolution``).
+
+        Returns
+        -------
+        (tokens, gh, gw)
+            ``tokens`` is ``[B, gh*gw, embed_dim]`` (patch tokens only, CLS
+            dropped), float32, **not** yet L2-normalized; ``gh, gw`` is the patch
+            grid (``14×14`` for ViT-B/16 @ 224).
+        """
+        visual = self.model.visual
+        if getattr(visual, "attn_pool", None) is not None:
+            raise RuntimeError(
+                "MaskCLIP dense 路徑僅支援 CLS-token pooling 的 ViT（如 ViT-B-16）；"
+                "此模型用 attn_pool，請改用支援的架構。"
+            )
+
+        x = visual._embeds(images)  # [B, 1+N, width]; batch_first
+        blocks = visual.transformer.resblocks
+        for blk in blocks[:-1]:
+            x = blk(x)
+
+        # --- last block: MaskCLIP value-only bypass (no q·k attention) ----------
+        last = blocks[-1]
+        x_ln = last.ln_1(x)  # [B, 1+N, width]
+        attn = last.attn
+        width = x_ln.shape[-1]
+        w_in = attn.in_proj_weight  # [3*width, width] (q, k, v stacked)
+        b_in = attn.in_proj_bias
+        w_v = w_in[2 * width : 3 * width]
+        b_v = None if b_in is None else b_in[2 * width : 3 * width]
+        v = F.linear(x_ln, w_v, b_v)  # [B, 1+N, width]
+        v = attn.out_proj(v)  # [B, 1+N, width]
+        # MaskCLIP keeps only the value path (drop residual + MLP). Apply the
+        # block's layer-scale ls_1 if present (Identity for ViT-B/16, so a no-op).
+        x = last.ls_1(v) if hasattr(last, "ls_1") else v
+
+        x = visual.ln_post(x)  # [B, 1+N, width]
+        if visual.proj is not None:
+            x = x @ visual.proj  # [B, 1+N, embed_dim]
+
+        tokens = x[:, 1:, :].float()  # drop CLS -> [B, N, embed_dim]
+        n_patches = tokens.shape[1]
+        grid = getattr(visual, "grid_size", None)
+        if grid is not None and int(grid[0]) * int(grid[1]) == n_patches:
+            gh, gw = int(grid[0]), int(grid[1])
+        else:  # square fallback (we resize inputs to a square R x R)
+            side = int(round(n_patches**0.5))
+            if side * side != n_patches:
+                raise RuntimeError(
+                    f"無法把 {n_patches} 個 patch token 還原成方形 grid；"
+                    f"請確認輸入已 resize 成方形。"
+                )
+            gh = gw = side
+        return tokens, gh, gw
+
     @torch.no_grad()
     def forward(self, image: Tensor) -> Tensor:
-        """Encode a single image into a dense grid of CLIP embeddings.
+        """Encode a single image into a dense grid of CLIP embeddings (MaskCLIP).
 
         Parameters
         ----------
@@ -273,9 +359,15 @@ class CLIPEncoder(nn.Module):
         Returns
         -------
         Tensor
-            Dense CLIP feature map ``[embed_dim, rows, cols]`` (``self.grid``),
-            each cell L2-normalized. This is the per-view GT analogous to
-            ``Camera.vgg_features``.
+            Dense CLIP feature map ``[embed_dim, gh, gw]`` (``14×14`` for
+            ViT-B/16), each cell L2-normalized. Drop-in replacement for the old
+            grid-window GT: same ``[D, gh, gw]`` contract, but the cells now carry
+            MaskCLIP per-patch dense semantics instead of whole-window embeddings.
+
+            The whole image is resized to a single ``input_resolution`` square and
+            run through the ViT **once** (cheaper than the old per-cell crops). The
+            rasterizer renders the language field at exactly ``gh×gw`` (square),
+            which matches this full-image-to-square GT.
         """
         if image.dim() == 4:
             if image.shape[0] != 1:
@@ -285,13 +377,16 @@ class CLIPEncoder(nn.Module):
             raise ValueError(f"forward 需要 [3, H, W] 或 [1, 3, H, W]，但拿到 {tuple(image.shape)}")
 
         image = image.to(device=self.device, dtype=self.compute_dtype)
-        rows, cols = self.grid
-        windows = [
-            self._resize_square(self._crop_cell(image, i, j))
-            for i in range(rows)
-            for j in range(cols)
-        ]
-        batch = torch.stack(windows, dim=0)  # [rows*cols, 3, R, R]
-        emb = self.encode_image(batch)  # [rows*cols, D]
-        # row-major (i*cols + j) -> [D, rows, cols]
-        return emb.t().reshape(self.embed_dim, rows, cols).contiguous()
+        res = self.input_resolution
+        # Whole image -> single R x R square (full content squished to square,
+        # matching the rasterizer rendering the field at gh×gw square).
+        img = F.interpolate(
+            image.unsqueeze(0), size=(res, res),
+            mode="bicubic", align_corners=False, antialias=True,
+        )  # [1, 3, R, R]
+        img = self._normalize(img)
+
+        tokens, gh, gw = self._dense_tokens(img)  # [1, gh*gw, D]
+        tokens = F.normalize(tokens[0], dim=-1)  # [gh*gw, D], per-cell L2
+        # row-major (i*gw + j) -> [D, gh, gw]
+        return tokens.t().reshape(self.embed_dim, gh, gw).contiguous()
