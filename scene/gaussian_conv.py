@@ -1,10 +1,42 @@
+import os
+
 import torch
 import torch_scatter
 from sklearn.neighbors import NearestNeighbors
 from fast_pytorch_kmeans import KMeans
 
+# 視為「關閉」的環境變數字面值（大小寫不敏感）。
+_SG_DECODER_COMPILE_FALSEY = {"", "0", "false", "no", "off"}
+
+# 啟動 parity 自檢容忍度（compiled vs eager 在 identical input 上的 max|Δ|）。
+# fp32 在 experiments/decoder_compile_ab.py 實測 ~4.6e-5；給一個遠高於該值、但仍
+# 足以擋住「compile 真的改了數值」的門檻。fp16 fused 路徑融合/重排後 rounding
+# 漂移較大（但仍受控），故用較寬的門檻。default-on 是 *guarded*：只有實測
+# max|Δ| < 對應門檻才真的放行 compile，否則永久 fallback 回 eager。
+_SG_PARITY_TOL_FP32 = 1e-3
+_SG_PARITY_TOL_FP16 = 5e-2
+
+
+def _resolve_decoder_compile(flag):
+    '''決定 GaussianConv 是否啟用 torch.compile（DEDICATED gate，不與 reimpl 的
+    REIMPL_COMPILE 混淆）。
+
+    建構參數 ``compile`` 優先：``True``/``False`` 直接生效；``None`` 表示沿用
+    環境變數 ``SG_DECODER_COMPILE``（**預設 = 開**，guarded default-on）。
+
+    注意：default-on 不等於「無條件編譯」——實際是否走 compiled 路徑由 forward 第
+    一次呼叫時的「啟動 parity 自檢」決定（見 ``_run_startup_parity_check``）：只有
+    eager-vs-compiled 的 max|Δ| < 容忍度才放行；否則永久 fallback 回 eager，數值與
+    未改前一致。要硬性關閉請設 ``SG_DECODER_COMPILE=0`` 或建構傳 ``compile=False``。
+    '''
+    if flag is not None:
+        return bool(flag)
+    return os.environ.get("SG_DECODER_COMPILE", "1").strip().lower() \
+        not in _SG_DECODER_COMPILE_FALSEY
+
+
 class GaussianConv(torch.nn.Module):
-    def __init__(self, xyz, input_channel=256, layers_channel=[256, 128, 64, 32, 3], downsample_layer=[], upsample_layer=[], K=8, out_channel=None):
+    def __init__(self, xyz, input_channel=256, layers_channel=[256, 128, 64, 32, 3], downsample_layer=[], upsample_layer=[], K=8, out_channel=None, compile=None):
         super(GaussianConv, self, ).__init__()
         assert len(downsample_layer) == len(upsample_layer) == 0 or \
             (len(downsample_layer) == len(upsample_layer) and max(downsample_layer) < min(upsample_layer)) ,\
@@ -35,6 +67,23 @@ class GaussianConv(torch.nn.Module):
         self.infer_dtype = None
         self._kernels_cast = None
         self._bias_cast = None
+
+        # torch.compile opt-in（DEDICATED gate，預設關閉、eager fallback）。
+        #   env SG_DECODER_COMPILE=1 或建構參數 compile=True（kwarg 優先）啟用。
+        # 關鍵：只編譯「內層 compute」(_forward_impl)，不包整個 nn.Module，
+        # 因此 gaussian_model.py 的 capture()/restore()/optimizer（state_dict /
+        # load_state_dict / parameters）完全不受影響。N 與每層寬度固定 →
+        # 不會反覆 recompile。
+        self._compile_enabled = _resolve_decoder_compile(compile)
+        self._compiled_fn = None
+
+        # 啟動 parity 自檢狀態（guarded default-on）：第一次 forward 真的要走 compiled
+        # 前，先在當下的 input 上比較 eager vs compiled 的 max|Δ|，只有 < 容忍度才
+        # 放行。三態：_parity_checked 是否已驗過；_parity_ok 是否通過；_parity_max_abs
+        # 量到的 max|Δ|（None=尚未檢查）。
+        self._parity_checked = False
+        self._parity_ok = False
+        self._parity_max_abs = None
 
         self.init_kmeans_knn(xyz, len(downsample_layer))
         self.init_conv_params(input_channel, layers_channel)
@@ -106,6 +155,92 @@ class GaussianConv(torch.nn.Module):
             return self.knn_indices[sample_level]
         return self._knn_indices_np[sample_level]
 
+    def _safe_to_compile(self):
+        '''是否走「安全可編譯」路徑。
+
+        條件：gpu-knn（避開 numpy 索引 graph-break）+ 無 down/up-sample（避開
+        torch_scatter.scatter 的 graph-break）+ dtype 為 fp32（infer_dtype is None）
+        **或** fp16（infer_dtype == torch.float16）。
+
+        fp16 曾被排除（只准 fp32）；現放寬以原型「fp16 + compiled fused decoder」，
+        看 compile（~1.47x）與 fp16（~3.7x）兩個加速能否疊加。bf16 不在白名單
+        （gfx1151 已知 bug，且 set_infer_dtype 也不該被設成 bf16）。實際放不放行仍由
+        啟動 parity 自檢把關（_run_startup_parity_check）。
+        '''
+        return (
+            self._compile_enabled
+            and self.use_gpu_knn
+            and self.infer_dtype in (None, torch.float16)
+            and not self.downsample_layer
+            and not self.upsample_layer
+        )
+
+    def _parity_tol(self):
+        '''啟動 parity 自檢容忍度，依 infer_dtype 取 fp32 / fp16 門檻。'''
+        return _SG_PARITY_TOL_FP16 if self.infer_dtype == torch.float16 else _SG_PARITY_TOL_FP32
+
+    @torch.no_grad()
+    def _run_startup_parity_check(self, features, compiled_fn):
+        '''啟動時 parity 自檢（guarded default-on 的關鍵）。
+
+        在當下這批 ``features`` 上比較 eager ``_forward_impl`` 與 ``compiled_fn`` 的
+        輸出 max|Δ|，只有 < ``_parity_tol()`` 才把 ``_parity_ok`` 設 True 放行 compile；
+        否則停用 compile、永久 fallback 回 eager。比對邏輯對齊
+        ``experiments/decoder_compile_ab.py``（max|Δ| on identical input）。只跑一次
+        （結果快取在 ``_parity_checked`` / ``_parity_ok``）。
+        '''
+        self._parity_checked = True
+        try:
+            eager_out = self._forward_impl(features).float()
+            compiled_out = compiled_fn(features).float()
+            max_abs = float((compiled_out - eager_out).abs().max().item())
+            self._parity_max_abs = max_abs
+            tol = self._parity_tol()
+            self._parity_ok = max_abs < tol
+            if not self._parity_ok:
+                import warnings
+
+                warnings.warn(
+                    f"GaussianConv 啟動 parity 自檢未過：max|Δ|={max_abs:.3e} >= "
+                    f"tol={tol:.1e}（infer_dtype={self.infer_dtype}）→ 停用 compile、"
+                    f"永久 fallback 回 eager。",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                self._compile_enabled = False
+                self._compiled_fn = None
+        except Exception as exc:  # pragma: no cover - 視 runtime 後端而定
+            import warnings
+
+            warnings.warn(
+                f"GaussianConv 啟動 parity 自檢執行失敗（{exc}）→ 停用 compile、"
+                f"fallback 回 eager。",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            self._parity_ok = False
+            self._compile_enabled = False
+            self._compiled_fn = None
+
+    def _get_compiled_fn(self):
+        '''lazy 建立 torch.compile 後的 _forward_impl；失敗印 warning 後 fallback
+        回 eager（回傳 None 讓 forward 走原路徑）。'''
+        if self._compiled_fn is not None:
+            return self._compiled_fn
+        try:
+            self._compiled_fn = torch.compile(self._forward_impl, mode="max-autotune")
+        except Exception as exc:  # pragma: no cover - 視 runtime 後端而定
+            import warnings
+
+            warnings.warn(
+                f"SG_DECODER_COMPILE 已開啟，但 torch.compile 失敗，fallback 回 eager：{exc}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            self._compile_enabled = False
+            self._compiled_fn = None
+        return self._compiled_fn
+
     def forward(self, features):
         '''
         Args:
@@ -113,6 +248,31 @@ class GaussianConv(torch.nn.Module):
             D: input_channel
             S: output_channel
         '''
+        if self._safe_to_compile():
+            fn = self._get_compiled_fn()
+            if fn is not None:
+                # guarded default-on：第一次走 compiled 前先做啟動 parity 自檢，
+                # 不通過就永久 fallback 回 eager。
+                if not self._parity_checked:
+                    self._run_startup_parity_check(features, fn)
+                if self._parity_ok:
+                    try:
+                        return fn(features)
+                    except Exception as exc:  # pragma: no cover - 視 runtime 後端而定
+                        import warnings
+
+                        warnings.warn(
+                            f"GaussianConv compiled forward 失敗，fallback 回 eager：{exc}",
+                            RuntimeWarning,
+                            stacklevel=2,
+                        )
+                        self._compile_enabled = False
+                        self._compiled_fn = None
+        return self._forward_impl(features)
+
+    def _forward_impl(self, features):
+        '''decoder 的純計算迴圈（torch.compile 的目標）；內容與原 forward 一致，
+        eager 路徑數值 byte-identical。'''
         dt = self.infer_dtype
         if dt is not None:
             features = features.to(dt)
