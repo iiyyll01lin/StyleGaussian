@@ -79,8 +79,19 @@ class SAMPooledEncoder(nn.Module):
         cleaner regions (16 is a good default for object-level pooling).
     pred_iou_thresh, stability_score_thresh : float
         SAM mask-quality filters (passed through to ``SamAutomaticMaskGenerator``).
-    min_region_area_frac : float
+        min_region_area_frac : float
         Drop SAM regions smaller than this fraction of the image area (noise).
+    per_pixel : bool
+        If ``True``, output a **high-resolution per-pixel** GT grid
+        ``[D, H//out_stride, W//out_stride]`` instead of the coarse ``grid``:
+        each output cell is painted with the masked-crop CLIP embedding of the
+        SAM region that *owns* that pixel (largest covering mask), giving sharp
+        object-shaped GT instead of the coarse 14×14 max-coverage painting. This
+        is roadmap A's ``sam_perpixel`` GT producer. ``False`` keeps the original
+        coarse ``[D, grid]`` pooled behaviour (back-compat).
+    out_stride : int
+        Downsample factor from the full image for the per-pixel output grid
+        (``per_pixel=True`` only). ``4`` → ``H/4 × W/4`` (e.g. 546×979 → 136×244).
     mask_bg : str
         How to treat the background of a region crop before CLIP: ``"black"``
         (zero out non-region pixels, object-centric) or ``"none"`` (plain bbox
@@ -117,6 +128,8 @@ class SAMPooledEncoder(nn.Module):
         mask_bg: str = "black",
         cache_dir: Optional[str] = None,
         chunk_size: int = 32,
+        per_pixel: bool = False,
+        out_stride: int = 4,
     ) -> None:
         super().__init__()
 
@@ -135,11 +148,16 @@ class SAMPooledEncoder(nn.Module):
                 f"找不到 SAM checkpoint：{sam_checkpoint}（請先下載，見 a1-sam STEP 1）。"
             )
 
+        if int(out_stride) < 1:
+            raise ValueError(f"out_stride 必須 >= 1，但拿到 {out_stride}")
+
         self.grid: Tuple[int, int] = (int(grid[0]), int(grid[1]))
         self.compute_dtype = dtype
         self.input_resolution = int(input_resolution)
         self.min_region_area_frac = float(min_region_area_frac)
         self.mask_bg = mask_bg
+        self.per_pixel = bool(per_pixel)
+        self.out_stride = int(out_stride)
         self.cache_dir = Path(cache_dir) if cache_dir else None
         if self.cache_dir is not None:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
@@ -180,8 +198,9 @@ class SAMPooledEncoder(nn.Module):
             stability_score_thresh=stability_score_thresh,
         )
 
+        mode_tag = f"pp{self.out_stride}" if self.per_pixel else f"g{self.grid[0]}x{self.grid[1]}"
         self._cfg_tag = (
-            f"{clip_model}_{clip_pretrained}_g{self.grid[0]}x{self.grid[1]}"
+            f"{clip_model}_{clip_pretrained}_{mode_tag}"
             f"_pps{points_per_side}_{mask_bg}_{sam_model_type}"
         )
 
@@ -246,9 +265,17 @@ class SAMPooledEncoder(nn.Module):
         if image.dim() != 3 or image.shape[0] != 3:
             raise ValueError(f"forward 需要 [3, H, W] 或 [1, 3, H, W]，但拿到 {tuple(image.shape)}")
 
-        gh, gw = self.grid
         D = self.embed_dim
         image = image.to(device=self.device, dtype=torch.float32).clamp(0.0, 1.0)
+        _, H, W = image.shape
+
+        # Output grid: coarse (gh, gw) for the pooled mode, or a high-res
+        # (H//out_stride, W//out_stride) per-pixel grid (roadmap A's sam_perpixel).
+        if self.per_pixel:
+            gh = max(1, H // self.out_stride)
+            gw = max(1, W // self.out_stride)
+        else:
+            gh, gw = self.grid
 
         cache_path = self._cache_path(image)
         if cache_path is not None and cache_path.is_file():
@@ -256,7 +283,6 @@ class SAMPooledEncoder(nn.Module):
             if tuple(grid_emb.shape) == (D, gh, gw):
                 return grid_emb.to(device=self.device, dtype=torch.float32)
 
-        _, H, W = image.shape
         img_np = (image.permute(1, 2, 0).contiguous().cpu().numpy() * 255.0).astype("uint8")
         masks = self.mask_generator.generate(img_np)  # list of dicts
 
@@ -271,26 +297,49 @@ class SAMPooledEncoder(nn.Module):
             grid_emb = whole.view(D, 1, 1).expand(D, gh, gw).contiguous()
             grid_emb = F.normalize(grid_emb, dim=0)
             if cache_path is not None:
-                torch.save(grid_emb.cpu(), str(cache_path))
+                torch.save(grid_emb.to("cpu", torch.float16), str(cache_path))
             return grid_emb
 
-        # --- per-region: coverage on the gh×gw grid + masked-crop CLIP emb ----
+        # --- per-region: coverage on the (gh, gw) grid + masked-crop CLIP emb ----
         covers: List[Tensor] = []
         crops: List[Tensor] = []
+        areas: List[float] = []
         for m in masks:
             seg = torch.from_numpy(m["segmentation"]).to(self.device).float()  # [H, W]
             cov = F.adaptive_avg_pool2d(seg.view(1, 1, H, W), (gh, gw)).view(gh, gw)
             covers.append(cov)
             crops.append(self._region_crop(image, seg, tuple(m["bbox"])))
+            areas.append(float(m.get("area", float(seg.sum().item()))))
 
         cov_stack = torch.stack(covers, dim=0)  # [R, gh, gw]
         region_emb = self.clip.encode_image(torch.stack(crops, dim=0))  # [R, D], L2-norm
 
-        # each cell -> the region with the highest coverage there
-        max_cov, best = cov_stack.max(dim=0)  # [gh, gw], [gh, gw]
+        if self.per_pixel:
+            # PER-PIXEL assignment (roadmap A): at this high resolution each output
+            # cell is tiny, so paint it with the masked-crop embedding of the SAM
+            # region that *owns* that pixel. Among masks covering a cell (cov>=0.5)
+            # pick the one with the LARGEST area (object-level, not a sub-part), so
+            # truck pixels get the whole-truck crop and road pixels the road crop —
+            # a sharp object-shaped GT instead of the old coarse 14×14 painting.
+            area_t = torch.tensor(areas, device=self.device, dtype=torch.float32)
+            covered = cov_stack >= 0.5  # [R, gh, gw]
+            score = torch.where(
+                covered,
+                area_t.view(-1, 1, 1).expand_as(cov_stack),
+                torch.full_like(cov_stack, -1.0),
+            )
+            best_area, best = score.max(dim=0)  # prefer largest covering mask
+            # cells with no strong cover -> fall back to highest-coverage region
+            max_cov, best_cov = cov_stack.max(dim=0)
+            no_strong = best_area < 0.0
+            best = torch.where(no_strong, best_cov, best)
+        else:
+            # each cell -> the region with the highest coverage there (coarse pooled)
+            max_cov, best = cov_stack.max(dim=0)  # [gh, gw], [gh, gw]
+
         grid_emb = region_emb[best.reshape(-1)].reshape(gh, gw, D).permute(2, 0, 1)  # [D, gh, gw]
 
-        # cells no region covers -> whole-image embedding
+        # cells no region covers at all -> whole-image embedding (rare at high res)
         uncovered = max_cov <= 1e-6  # [gh, gw]
         if bool(uncovered.any()):
             grid_emb = grid_emb.clone()
@@ -299,5 +348,5 @@ class SAMPooledEncoder(nn.Module):
         grid_emb = F.normalize(grid_emb.contiguous(), dim=0)  # per-cell L2
 
         if cache_path is not None:
-            torch.save(grid_emb.cpu(), str(cache_path))
+            torch.save(grid_emb.to("cpu", torch.float16), str(cache_path))
         return grid_emb

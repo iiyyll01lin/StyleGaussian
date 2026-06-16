@@ -108,6 +108,9 @@ class CLIPEncoder(nn.Module):
         input_resolution: int = 224,
         dtype: torch.dtype = torch.float32,
         chunk_size: int = 32,
+        dense_mode: str = "maskclip",
+        ms_tilings: Sequence[int] = (1, 2, 3),
+        ms_overlap: float = 0.3,
     ) -> None:
         super().__init__()
 
@@ -124,7 +127,19 @@ class CLIPEncoder(nn.Module):
             raise ValueError("gfx1151 已知 bf16 bug：請改用 fp32 或 fp16 (HANDOFF §11)。")
         if chunk_size < 1:
             raise ValueError(f"chunk_size 必須 >= 1，但拿到 {chunk_size}")
+        if dense_mode not in ("maskclip", "multiscale"):
+            raise ValueError(
+                f"dense_mode 必須是 'maskclip' 或 'multiscale'，但拿到 {dense_mode!r}"
+            )
+        ms_tilings = tuple(int(t) for t in ms_tilings)
+        if len(ms_tilings) < 1 or any(t < 1 for t in ms_tilings):
+            raise ValueError(f"ms_tilings 必須是 >=1 的整數序列，但拿到 {ms_tilings}")
+        if not (0.0 <= ms_overlap < 1.0):
+            raise ValueError(f"ms_overlap 必須落在 [0, 1)，但拿到 {ms_overlap}")
 
+        self.dense_mode = dense_mode
+        self.ms_tilings: Tuple[int, ...] = ms_tilings
+        self.ms_overlap = float(ms_overlap)
         self.model_name = model_name
         self.pretrained = pretrained
         self.grid: Tuple[int, int] = (int(grid[0]), int(grid[1]))
@@ -387,6 +402,90 @@ class CLIPEncoder(nn.Module):
             gh = gw = side
         return tokens, gh, gw
 
+    def _square_grid(self, image: Tensor) -> Tensor:
+        """MaskCLIP dense grid ``[D, gh, gw]`` from one ``[3, H, W]`` image.
+
+        Squishes the whole image to a single ``input_resolution`` square and runs
+        the value-projection dense path once. This is the original (``dense_mode
+        == "maskclip"``) GT, factored out so the multi-scale fusion can reuse it.
+        """
+        res = self.input_resolution
+        img = F.interpolate(
+            image.unsqueeze(0), size=(res, res),
+            mode="bicubic", align_corners=False, antialias=True,
+        )  # [1, 3, R, R]
+        img = self._normalize(img)
+        tokens, gh, gw = self._dense_tokens(img)  # [1, gh*gw, D]
+        tokens = F.normalize(tokens[0], dim=-1)  # [gh*gw, D], per-cell L2
+        return tokens.t().reshape(self.embed_dim, gh, gw).contiguous()
+
+    def _crop_tile(self, image: Tensor, i: int, j: int, n: int) -> Tensor:
+        """Crop tile ``(i, j)`` of an overlapping ``n x n`` tiling from ``[3,H,W]``."""
+        _, H, W = image.shape
+        th, tw = H / n, W / n
+        cy, cx = (i + 0.5) * th, (j + 0.5) * tw
+        half_h = th * (1.0 + self.ms_overlap) / 2.0
+        half_w = tw * (1.0 + self.ms_overlap) / 2.0
+        top = max(0, int(round(cy - half_h)))
+        bottom = min(H, int(round(cy + half_h)))
+        left = max(0, int(round(cx - half_w)))
+        right = min(W, int(round(cx + half_w)))
+        bottom = max(bottom, top + 1)
+        right = max(right, left + 1)
+        return image[:, top:bottom, left:right]
+
+    @torch.no_grad()
+    def _multiscale_grid(self, image: Tensor) -> Tensor:
+        """Multi-scale MaskCLIP fusion grid ``[D, G, G]`` from one ``[3, H, W]``.
+
+        Runs the value-projection dense path at several **crop scales** and fuses
+        the per-location features in a common ``G x G`` grid (``G`` = the native
+        full-image patch grid, ``14`` for ViT-B/16 @ 224). For each tiling ``n``
+        in ``ms_tilings`` we crop the image into an overlapping ``n x n`` grid,
+        resize **each crop** to ``input_resolution`` square and extract its
+        MaskCLIP dense tokens, then paint the crop's tokens into its footprint of
+        the global grid (averaging where scales/crops overlap), and finally
+        re-normalize per cell.
+
+        Motivation: vanilla MaskCLIP only de-pools the **last** attention layer —
+        every patch token has still globally attended across all earlier layers,
+        so a token over the truck is contaminated by road/sky context (the
+        sharpened root cause: whole-image CLIP token semantics mix truck and
+        road). A crop centred on the truck contains *mostly* truck, so its
+        per-patch tokens carry cleaner local semantics; fusing the global (1x1)
+        scale keeps scene context. This is a different lever from raising the
+        resolution (res448) or region pooling (SAM), both of which kept the
+        full-image receptive field.
+        """
+        # Global (1x1) grid sets the fused output resolution G x G.
+        base = self._square_grid(image)  # [D, G, G] (already per-cell L2)
+        D, G, _ = base.shape
+        acc = base.clone()
+        cnt = torch.ones((G, G), device=base.device, dtype=base.dtype)
+
+        for n in self.ms_tilings:
+            if n == 1:
+                continue  # already counted as `base`
+            for i in range(n):
+                r0 = int(round(i * G / n))
+                r1 = max(r0 + 1, int(round((i + 1) * G / n)))
+                for j in range(n):
+                    c0 = int(round(j * G / n))
+                    c1 = max(c0 + 1, int(round((j + 1) * G / n)))
+                    crop = self._crop_tile(image, i, j, n)  # [3, hc, wc]
+                    grid = self._square_grid(crop)  # [D, G, G] per-cell L2
+                    fh, fw = r1 - r0, c1 - c0
+                    g_rs = F.interpolate(
+                        grid.unsqueeze(0), size=(fh, fw),
+                        mode="bilinear", align_corners=False,
+                    )[0]  # [D, fh, fw]
+                    acc[:, r0:r1, c0:c1] = acc[:, r0:r1, c0:c1] + g_rs
+                    cnt[r0:r1, c0:c1] = cnt[r0:r1, c0:c1] + 1.0
+
+        fused = acc / cnt.unsqueeze(0)  # [D, G, G]
+        fused = F.normalize(fused, dim=0)  # per-cell L2
+        return fused.contiguous()
+
     @torch.no_grad()
     def forward(self, image: Tensor) -> Tensor:
         """Encode a single image into a dense grid of CLIP embeddings (MaskCLIP).
@@ -402,13 +501,14 @@ class CLIPEncoder(nn.Module):
         Tensor
             Dense CLIP feature map ``[embed_dim, gh, gw]`` (``14×14`` for
             ViT-B/16), each cell L2-normalized. Drop-in replacement for the old
-            grid-window GT: same ``[D, gh, gw]`` contract, but the cells now carry
-            MaskCLIP per-patch dense semantics instead of whole-window embeddings.
+            grid-window GT: same ``[D, gh, gw]`` contract.
 
-            The whole image is resized to a single ``input_resolution`` square and
-            run through the ViT **once** (cheaper than the old per-cell crops). The
-            rasterizer renders the language field at exactly ``gh×gw`` (square),
-            which matches this full-image-to-square GT.
+            * ``dense_mode == "maskclip"`` (default): the whole image is resized to
+              a single ``input_resolution`` square and run through the ViT **once**
+              (value-projection dense path).
+            * ``dense_mode == "multiscale"``: the value-projection grid is fused
+              across crop scales (``ms_tilings``) to suppress global-attention
+              contamination — see :meth:`_multiscale_grid`.
         """
         if image.dim() == 4:
             if image.shape[0] != 1:
@@ -418,16 +518,6 @@ class CLIPEncoder(nn.Module):
             raise ValueError(f"forward 需要 [3, H, W] 或 [1, 3, H, W]，但拿到 {tuple(image.shape)}")
 
         image = image.to(device=self.device, dtype=self.compute_dtype)
-        res = self.input_resolution
-        # Whole image -> single R x R square (full content squished to square,
-        # matching the rasterizer rendering the field at gh×gw square).
-        img = F.interpolate(
-            image.unsqueeze(0), size=(res, res),
-            mode="bicubic", align_corners=False, antialias=True,
-        )  # [1, 3, R, R]
-        img = self._normalize(img)
-
-        tokens, gh, gw = self._dense_tokens(img)  # [1, gh*gw, D]
-        tokens = F.normalize(tokens[0], dim=-1)  # [gh*gw, D], per-cell L2
-        # row-major (i*gw + j) -> [D, gh, gw]
-        return tokens.t().reshape(self.embed_dim, gh, gw).contiguous()
+        if self.dense_mode == "multiscale":
+            return self._multiscale_grid(image)
+        return self._square_grid(image)

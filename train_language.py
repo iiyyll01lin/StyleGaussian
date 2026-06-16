@@ -56,7 +56,8 @@ def training(dataset, opt, pipe, ply_path, debug_from, low_dim=32,
              clip_model="ViT-B-16", clip_pretrained="openai", clip_grid=8,
              distill_loss="l1", clip_input_res=224, gt_mode="maskclip",
              sam_checkpoint=None, sam_model_type="vit_b", sam_grid=14,
-             sam_points_per_side=16, sam_cache_dir=None):
+             sam_points_per_side=16, sam_cache_dir=None, sam_out_stride=4,
+             clip_dense_mode="maskclip"):
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree)
@@ -69,23 +70,27 @@ def training(dataset, opt, pipe, ply_path, debug_from, low_dim=32,
     # Two GT producers, SAME [D, gh, gw] contract downstream:
     #   * gt_mode="maskclip" (default): MaskCLIP per-patch dense tokens (no SAM).
     #   * gt_mode="sam_pooled" (roadmap A1 fallback): SAM regions -> per-region
-    #     CLIP -> painted into the grid, for cleaner object masks.
-    if gt_mode == "sam_pooled":
+    #     CLIP -> painted into the coarse grid, for cleaner object masks.
+    #   * gt_mode="sam_perpixel" (roadmap A): SAM regions -> per-region masked-crop
+    #     CLIP -> painted PER-PIXEL onto a high-res H/stride x W/stride grid (sharp,
+    #     object-shaped GT; passes the A0 GT-level truck-vs-road corr gate).
+    if gt_mode in ("sam_pooled", "sam_perpixel"):
         from scene.sam_pooled_encoder import SAMPooledEncoder
         if not sam_checkpoint:
-            raise ValueError("gt_mode=sam_pooled 需要 --sam_checkpoint <path>.")
+            raise ValueError(f"gt_mode={gt_mode} 需要 --sam_checkpoint <path>.")
         clip_encoder = SAMPooledEncoder(
             sam_checkpoint=sam_checkpoint, sam_model_type=sam_model_type,
             clip_model=clip_model, clip_pretrained=clip_pretrained,
             device="cuda", grid=(sam_grid, sam_grid), dtype=torch.float32,
             input_resolution=clip_input_res, points_per_side=sam_points_per_side,
             cache_dir=sam_cache_dir,
+            per_pixel=(gt_mode == "sam_perpixel"), out_stride=sam_out_stride,
         )
     else:
         clip_encoder = CLIPEncoder(
             model_name=clip_model, pretrained=clip_pretrained,
             device="cuda", grid=(clip_grid, clip_grid), dtype=torch.float32,
-            input_resolution=clip_input_res,
+            input_resolution=clip_input_res, dense_mode=clip_dense_mode,
         )
 
     # Load the (shared, same-as-feature/artistic) reconstruction ply and bake the
@@ -213,9 +218,17 @@ if __name__ == "__main__":
                         help="CLIP image-tower input resolution; drives the MaskCLIP patch grid "
                              "(ViT-B/16: res/16 per side, so 224->14x14, 448->28x28 = denser GT)")
     parser.add_argument("--gt_mode", type=str, default="maskclip",
-                        choices=["maskclip", "sam_pooled"],
-                        help="CLIP GT producer: 'maskclip' (per-patch dense tokens, default) or "
-                             "'sam_pooled' (SAM region-pooled CLIP, roadmap A1 fallback)")
+                        choices=["maskclip", "sam_pooled", "sam_perpixel"],
+                        help="CLIP GT producer: 'maskclip' (per-patch dense tokens, default), "
+                             "'sam_pooled' (SAM region-pooled CLIP into coarse grid) or "
+                             "'sam_perpixel' (roadmap A: SAM masked-crop CLIP painted per-pixel "
+                             "onto a high-res H/stride grid, sharp object-shaped GT)")
+    parser.add_argument("--clip_dense_mode", type=str, default="maskclip",
+                        choices=["maskclip", "multiscale"],
+                        help="MaskCLIP dense path (gt_mode=maskclip only): 'maskclip' "
+                             "(single full-image value-projection grid, default) or 'multiscale' "
+                             "(fuse value-projection across crop scales to cut global-attention "
+                             "contamination — B2 stronger-GT bet)")
     parser.add_argument("--sam_checkpoint", type=str, default=None,
                         help="SAM checkpoint path (required for --gt_mode sam_pooled)")
     parser.add_argument("--sam_model_type", type=str, default="vit_b",
@@ -227,6 +240,9 @@ if __name__ == "__main__":
                         help="SAM automatic-mask sampling density (fewer = larger, cleaner regions)")
     parser.add_argument("--sam_cache_dir", type=str, default=None,
                         help="dir to cache SAM-pooled [D,gh,gw] GT grids (skips SAM+CLIP on re-run)")
+    parser.add_argument("--sam_out_stride", type=int, default=4,
+                        help="gt_mode=sam_perpixel: high-res output grid downsample factor "
+                             "(H/stride x W/stride; 4 -> 136x244 for 546x979)")
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
 
@@ -250,7 +266,8 @@ if __name__ == "__main__":
              distill_loss=args.distill_loss, clip_input_res=args.clip_input_res,
              gt_mode=args.gt_mode, sam_checkpoint=args.sam_checkpoint,
              sam_model_type=args.sam_model_type, sam_grid=args.sam_grid,
-             sam_points_per_side=args.sam_points_per_side, sam_cache_dir=args.sam_cache_dir)
+             sam_points_per_side=args.sam_points_per_side, sam_cache_dir=args.sam_cache_dir,
+             sam_out_stride=args.sam_out_stride, clip_dense_mode=args.clip_dense_mode)
 
     # All done
     print("\nLanguage training complete.")
