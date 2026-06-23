@@ -101,6 +101,16 @@ def training(dataset, opt, pipe, ply_path, debug_from, low_dim=32,
             input_resolution=clip_input_res, dtype=torch.float32,
             clip_grid=(clip_grid, clip_grid), dense_mode=clip_dense_mode,
         )
+    elif gt_mode == "siglip_dense":
+        # Phase-2 (stronger-VLM-signal): SigLIP2 dense GT via the MAP-head
+        # value-bypass (繞過 latent-query pooling). Still a [D, gh, gw] grid in the
+        # SigLIP joint space, so the field / clip_linear decoder / relevancy / eval
+        # are unchanged — BUT eval MUST use the same SigLIP backbone as text tower.
+        from scene.siglip_dense_encoder import SigLIPDenseEncoder
+        clip_encoder = SigLIPDenseEncoder(
+            model_name=clip_model, pretrained=clip_pretrained,
+            device="cuda", input_resolution=clip_input_res, dtype=torch.float32,
+        )
     else:
         clip_encoder = CLIPEncoder(
             model_name=clip_model, pretrained=clip_pretrained,
@@ -233,7 +243,7 @@ if __name__ == "__main__":
                         help="CLIP image-tower input resolution; drives the MaskCLIP patch grid "
                              "(ViT-B/16: res/16 per side, so 224->14x14, 448->28x28 = denser GT)")
     parser.add_argument("--gt_mode", type=str, default="maskclip",
-                        choices=["maskclip", "sam_pooled", "sam_perpixel", "langsplat_ae"],
+                        choices=["maskclip", "sam_pooled", "sam_perpixel", "langsplat_ae", "siglip_dense"],
                         help="CLIP GT producer: 'maskclip' (per-patch dense tokens, default), "
                              "'sam_pooled' (SAM region-pooled CLIP into coarse grid), "
                              "'sam_perpixel' (roadmap A: SAM masked-crop CLIP painted per-pixel "
