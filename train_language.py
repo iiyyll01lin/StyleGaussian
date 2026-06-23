@@ -57,7 +57,7 @@ def training(dataset, opt, pipe, ply_path, debug_from, low_dim=32,
              distill_loss="l1", clip_input_res=224, gt_mode="maskclip",
              sam_checkpoint=None, sam_model_type="vit_b", sam_grid=14,
              sam_points_per_side=16, sam_cache_dir=None, sam_out_stride=4,
-             clip_dense_mode="maskclip"):
+             clip_dense_mode="maskclip", ae_checkpoint=None):
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree)
@@ -85,6 +85,21 @@ def training(dataset, opt, pipe, ply_path, debug_from, low_dim=32,
             input_resolution=clip_input_res, points_per_side=sam_points_per_side,
             cache_dir=sam_cache_dir,
             per_pixel=(gt_mode == "sam_perpixel"), out_stride=sam_out_stride,
+        )
+    elif gt_mode == "langsplat_ae":
+        # Option B: MaskCLIP dense grid -> per-scene autoencoder denoise (still
+        # CLIP-512 output, so the field / clip_linear decoder / relevancy / eval
+        # are all unchanged). The AE is fit offline by build_langsplat_ae.py and
+        # projects each noisy MaskCLIP token back onto the scene CLIP manifold.
+        from scene.langsplat_ae_encoder import LangSplatAEEncoder
+        if not ae_checkpoint:
+            raise ValueError("gt_mode=langsplat_ae 需要 --ae_checkpoint <path> "
+                             "(先用 experiments/build_langsplat_ae.py 產生).")
+        clip_encoder = LangSplatAEEncoder(
+            ae_checkpoint=ae_checkpoint, clip_model=clip_model,
+            clip_pretrained=clip_pretrained, device="cuda",
+            input_resolution=clip_input_res, dtype=torch.float32,
+            clip_grid=(clip_grid, clip_grid), dense_mode=clip_dense_mode,
         )
     else:
         clip_encoder = CLIPEncoder(
@@ -218,11 +233,14 @@ if __name__ == "__main__":
                         help="CLIP image-tower input resolution; drives the MaskCLIP patch grid "
                              "(ViT-B/16: res/16 per side, so 224->14x14, 448->28x28 = denser GT)")
     parser.add_argument("--gt_mode", type=str, default="maskclip",
-                        choices=["maskclip", "sam_pooled", "sam_perpixel"],
+                        choices=["maskclip", "sam_pooled", "sam_perpixel", "langsplat_ae"],
                         help="CLIP GT producer: 'maskclip' (per-patch dense tokens, default), "
-                             "'sam_pooled' (SAM region-pooled CLIP into coarse grid) or "
+                             "'sam_pooled' (SAM region-pooled CLIP into coarse grid), "
                              "'sam_perpixel' (roadmap A: SAM masked-crop CLIP painted per-pixel "
-                             "onto a high-res H/stride grid, sharp object-shaped GT)")
+                             "onto a high-res H/stride grid, sharp object-shaped GT) or "
+                             "'langsplat_ae' (Option B: MaskCLIP dense grid denoised through a "
+                             "per-scene autoencoder; still CLIP-512 so eval is unchanged — "
+                             "requires --ae_checkpoint from build_langsplat_ae.py)")
     parser.add_argument("--clip_dense_mode", type=str, default="maskclip",
                         choices=["maskclip", "multiscale"],
                         help="MaskCLIP dense path (gt_mode=maskclip only): 'maskclip' "
@@ -243,6 +261,9 @@ if __name__ == "__main__":
     parser.add_argument("--sam_out_stride", type=int, default=4,
                         help="gt_mode=sam_perpixel: high-res output grid downsample factor "
                              "(H/stride x W/stride; 4 -> 136x244 for 546x979)")
+    parser.add_argument("--ae_checkpoint", type=str, default=None,
+                        help="per-scene CLIP autoencoder checkpoint (required for "
+                             "--gt_mode langsplat_ae; produced by experiments/build_langsplat_ae.py)")
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
 
@@ -267,7 +288,8 @@ if __name__ == "__main__":
              gt_mode=args.gt_mode, sam_checkpoint=args.sam_checkpoint,
              sam_model_type=args.sam_model_type, sam_grid=args.sam_grid,
              sam_points_per_side=args.sam_points_per_side, sam_cache_dir=args.sam_cache_dir,
-             sam_out_stride=args.sam_out_stride, clip_dense_mode=args.clip_dense_mode)
+             sam_out_stride=args.sam_out_stride, clip_dense_mode=args.clip_dense_mode,
+             ae_checkpoint=args.ae_checkpoint)
 
     # All done
     print("\nLanguage training complete.")
