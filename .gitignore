@@ -7,4 +7,6 @@ tensorboard_3d
 screenshots
 *egg-info
 submodules/adain/models
-submodules/adain/input
+submodules/adain/inputdatasets/
+output/
+checkpoints/

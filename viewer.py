@@ -18,7 +18,7 @@ from utils.general_utils import get_image_paths
 
 
 class ViserViewer:
-    def __init__(self, gaussians, pipeline, background, override_color, training_cams, wikiart_img_paths=None, viewer_port='8080'):
+    def __init__(self, gaussians, pipeline, background, override_color, training_cams, wikiart_img_paths=None, viewer_port=8080):
         self.gaussians = gaussians
         self.pipeline = pipeline
         self.background = background
@@ -289,7 +289,7 @@ if __name__ == "__main__":
     model = ModelParams(parser, sentinel=True)
     pipeline = PipelineParams(parser)
     parser.add_argument("--style_folder", type=str, default="images")
-    parser.add_argument("--viewer_port", type=str, default="8080")
+    parser.add_argument("--viewer_port", type=int, default=8080)
     args = get_combined_args(parser)
     print("Rendering " + args.model_path)
 
