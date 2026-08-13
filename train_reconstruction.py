@@ -28,10 +28,38 @@ try:
 except ImportError:
     TENSORBOARD_FOUND = False
 
+def _anti_floater_reg(gaussians, kind):
+    """Anti-floater regularizer on the (sigmoid-activated) opacity.
+
+    The native truck reconstruction is PSNR-healthy but ~53% of its gaussians
+    are near-transparent floaters (opacity<0.005).  Aggressive densify-control
+    guards remove them but collapse held-out PSNR around the opacity-reset.
+    This is the gentler lever: keep the *default* (PSNR-stable) densify
+    dynamics untouched and add a tiny pressure that makes floaters droppable by
+    the densify prune (which already culls opacity<min_opacity=0.005).
+
+      * "opacity_entropy" — binary entropy -(o·ln o+(1-o)·ln(1-o)); minimizing
+        it is BIMODAL: it pushes o<0.5 toward 0 (→ pruned) and o>0.5 toward 1,
+        so it does NOT penalize the opaque gaussians that carry the image
+        (PSNR-preserving), only resolves the ambiguous/floater population.
+      * "opacity_l1"      — mean(o); a plain sparsity pressure on total opacity
+        mass (cheaper, but pushes all opacities down, so use a small weight).
+
+    Returns a scalar tensor (0 when kind=="none").
+    """
+    o = gaussians.get_opacity
+    if kind == "opacity_l1":
+        return o.mean()
+    if kind == "opacity_entropy":
+        o = o.clamp(1e-6, 1.0 - 1e-6)
+        return (-(o * torch.log(o) + (1.0 - o) * torch.log(1.0 - o))).mean()
+    return o.sum() * 0.0  # "none": exactly zero, keeps the graph well-formed
+
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from,
              max_point_num=400_000, decouple_prune=True,
              postreset_prune_cooldown=0, postreset_freeze_cooldown=0,
-             overcap_prune_size_only=False, overcap_prune_every=1):
+             overcap_prune_size_only=False, overcap_prune_every=1,
+             anti_floater="none", anti_floater_weight=0.0, anti_floater_from_iter=0):
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree)
@@ -78,6 +106,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         gt_image = viewpoint_cam.original_image.cuda()
         Ll1 = l1_loss(image, gt_image)
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
+        # Anti-floater regularizer (default OFF -> byte-identical to upstream).
+        if anti_floater != "none" and anti_floater_weight > 0.0 and iteration >= anti_floater_from_iter:
+            loss = loss + anti_floater_weight * _anti_floater_reg(gaussians, anti_floater)
         loss.backward()
 
         iter_end.record()
@@ -220,6 +251,16 @@ if __name__ == "__main__":
                         help="over the cap, prune only oversized/large-screen splats (skip opacity prune)")
     parser.add_argument("--overcap_prune_every", type=int, default=1,
                         help="over the cap, run the prune only every Kth densify step")
+    # Anti-floater regularizer (A2): gentle, PSNR-preserving lever that keeps the
+    # default densify dynamics and makes near-transparent floaters droppable by
+    # the existing densify prune.  Default off = upstream behaviour.
+    parser.add_argument("--anti_floater", type=str, default="none",
+                        choices=["none", "opacity_l1", "opacity_entropy"],
+                        help="opacity regularizer to suppress floaters (default none)")
+    parser.add_argument("--anti_floater_weight", type=float, default=0.0,
+                        help="loss weight for the anti-floater regularizer")
+    parser.add_argument("--anti_floater_from_iter", type=int, default=0,
+                        help="start applying the anti-floater reg at this iter")
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     
@@ -237,7 +278,9 @@ if __name__ == "__main__":
     training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from,
              max_point_num=args.max_point_num, decouple_prune=not args.legacy_cap_freeze,
              postreset_prune_cooldown=args.postreset_prune_cooldown, postreset_freeze_cooldown=args.postreset_freeze_cooldown,
-             overcap_prune_size_only=args.overcap_prune_size_only, overcap_prune_every=args.overcap_prune_every)
+             overcap_prune_size_only=args.overcap_prune_size_only, overcap_prune_every=args.overcap_prune_every,
+             anti_floater=args.anti_floater, anti_floater_weight=args.anti_floater_weight,
+             anti_floater_from_iter=args.anti_floater_from_iter)
 
     # All done
     print("\nReconstruction complete.")
